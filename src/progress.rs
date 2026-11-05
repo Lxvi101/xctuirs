@@ -111,7 +111,11 @@ impl Progress {
             }
             return;
         }
-        if let Some(rest) = line.strip_prefix("Target dependency graph (") {
+        // Printed as "note: Target dependency graph (27 targets)" by current Xcodes.
+        if let Some(rest) = line
+            .find("Target dependency graph (")
+            .map(|i| &line[i + "Target dependency graph (".len()..])
+        {
             if let Some(n) = rest.split_whitespace().next().and_then(|n| n.parse().ok()) {
                 self.total_targets = n;
             }
@@ -152,10 +156,15 @@ impl Progress {
             self.target = target.to_owned();
         }
         self.tasks_in_target += 1;
-        self.stage = stage_for(kind).unwrap_or(self.stage);
         if self.stage == Stage::Preparing || self.stage == Stage::Resolving {
             self.stage = Stage::Compiling;
         }
+        // Bookkeeping tasks count towards progress but would only make the
+        // label flicker between meaningless names.
+        if NOISE.contains(&kind) {
+            return;
+        }
+        self.stage = stage_for(kind).unwrap_or(self.stage);
         self.detail = detail_for(kind, args).unwrap_or_default();
     }
 
@@ -205,6 +214,21 @@ impl Progress {
         Some((blended - elapsed).max(1.0))
     }
 }
+
+const NOISE: &[&str] = &[
+    "WriteAuxiliaryFile",
+    "MkDir",
+    "Touch",
+    "SymLink",
+    "CreateBuildDirectory",
+    "RegisterExecutionPolicyException",
+    "ClangStatCache",
+    "SwiftDriverJobDiscovery",
+    "SwiftMergeGeneratedHeaders",
+    "ProcessProductPackagingDER",
+    "RegisterWithLaunchServices",
+    "Validate",
+];
 
 fn stage_for(kind: &str) -> Option<Stage> {
     Some(match kind {
@@ -293,11 +317,7 @@ fn detail_for(kind: &str, args: &str) -> Option<String> {
         ".strings",
         ".xcstrings",
     ];
-    if let Some(path) = words
-        .iter()
-        .filter(|w| w.starts_with('/'))
-        .find(|w| source.iter().any(|s| w.ends_with(s)))
-    {
+    if let Some(path) = words.iter().find(|w| source.iter().any(|s| w.ends_with(s))) {
         return path.rsplit('/').next().map(str::to_owned);
     }
     if matches!(kind, "Ld" | "CodeSign") {
@@ -320,8 +340,10 @@ mod tests {
         p.line("Resolve Package Graph");
         assert_eq!(p.stage, Stage::Resolving);
         p.line("note: Target dependency graph (3 targets)");
-        p.line("Target dependency graph (3 targets)");
         assert_eq!(p.total_targets, 3);
+        p.line("WriteAuxiliaryFile /DD/x.hmap (in target 'App' from project 'App')");
+        assert_eq!(p.stage, Stage::Compiling);
+        assert_eq!(p.tasks, 1);
         p.line("SwiftCompile normal arm64 /src/App/Views/Home\\ View.swift (in target 'App' from project 'App')");
         assert_eq!(p.stage, Stage::Compiling);
         assert_eq!(p.detail, "Home View.swift");
@@ -337,8 +359,13 @@ mod tests {
         assert_eq!(p.detail, "App");
         p.line("CodeSign /DD/App.app (in target 'App' from project 'App')");
         assert_eq!(p.stage, Stage::Signing);
-        assert_eq!(p.tasks, 5);
-        assert_eq!(p.targets_started(), 2);
+        p.line("ProcessInfoPlistFile /DD/Pod.bundle/Info.plist Pods/Target\\ Support\\ Files/Pod/Res-Info.plist (in target 'Pod' from project 'Pods')");
+        assert_eq!(p.stage, Stage::Resources);
+        assert_eq!(p.detail, "Info.plist");
+        p.line("CompileC /o/a.o App/Sources/Thing.m normal arm64 objective-c x (in target 'App' from project 'App')");
+        assert_eq!(p.detail, "Thing.m");
+        assert_eq!(p.tasks, 8);
+        assert_eq!(p.targets_started(), 3);
     }
 
     #[test]
