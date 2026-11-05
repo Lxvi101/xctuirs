@@ -1,6 +1,22 @@
-//! Interactive terminal interface. All Apple tool work stays off the input/render thread.
+//! Interactive terminal interface: one screen.
+//!
+//! ```text
+//!  Puzzle   s ◆ Puzzle    d ▯ My iPhone
+//!
+//!  ⠹ Compiling  BoardView.swift · Puzzle                  1:48 · ~1:05 left
+//!  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────────  62%
+//!  18 of 27 targets · 412 tasks · 3 warnings
+//!  ── Build ─ Console ──────────────────────────────────────────────────
+//!  …log…
+//!  ▶ r Run on My iPhone    b build  t test  c clean  h history  ? keys
+//! ```
+//!
+//! All Apple tool work stays off the input/render thread. Rendering only walks
+//! the visible part of the log, so large build logs stay responsive.
 use crate::{
-    job::Job,
+    diagnose,
+    job::{self, Job},
+    progress::{Estimate, Progress, Stage},
     runtime::{self, Event, Task},
     store::{self, Prefs},
     xcode::{self, Destination, Project, Scheme},
@@ -8,11 +24,12 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+        MouseEventKind,
     },
     execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 use ratatui::{
     Frame, Terminal,
@@ -20,12 +37,11 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Clear, Paragraph},
 };
 use std::{
-    collections::HashMap,
     io::{self, IsTerminal},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc,
@@ -33,50 +49,52 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const PLATFORMS: &[&str] = &["Destinations", "iOS", "tvOS", "watchOS", "macOS"];
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const HELP: &[(&str, &str)] = &[
-    ("b", "build"),
-    ("r", "run"),
-    ("t", "test"),
-    ("c", "clean"),
-    ("p", "resolve packages"),
+    ("r", "run (build, install, launch)"),
+    ("b  t  c  p", "build · test · clean · resolve packages"),
     ("x", "stop"),
-    ("0-4", "focus a pane"),
-    ("tab / shift+tab", "next / previous pane"),
-    (
-        "[ / ]",
-        "tabs of Scheme (schemes, packages) or Destinations (all, iOS, tvOS, …)",
-    ),
-    ("j / k", "move in the pane"),
-    ("enter / space", "select the scheme or destination"),
-    ("R", "rename the simulator under the cursor"),
-    (
-        "/",
-        "filter the pane (lists, or the shown log); enter keeps, esc clears",
-    ),
-    ("g / G", "top / bottom"),
-    ("ctrl+u / ctrl+d", "half a page of the log"),
-    ("pgup / pgdn", "a page"),
-    ("+ / _", "expand the left pane / restore"),
-    ("i", "issues only"),
-    ("s", "show / hide console timestamps"),
-    ("e", "open the shown log in $EDITOR"),
-    ("D", "delete the run history"),
-    ("? / F1", "this help"),
+    ("s", "scheme"),
+    ("d", "device or simulator"),
+    ("h", "history"),
+    ("tab", "build log ⇄ app console"),
+    ("i", "problems only ⇄ full log"),
+    ("/", "filter the log"),
+    ("↑ ↓  pgup pgdn", "scroll"),
+    ("g  G", "top · follow the end"),
+    ("e", "open the log in $EDITOR"),
+    ("esc", "clear filter · back to the latest run"),
     ("q", "quit"),
 ];
+
+fn dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+fn bold() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
 
 struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(e) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange
+        ) {
             let _ = terminal::disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                io::stdout(),
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             return Err(e.into());
         }
         Ok(Self)
@@ -87,6 +105,8 @@ impl Drop for TerminalGuard {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            SetTitle(""),
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen,
             crossterm::cursor::Show
@@ -94,179 +114,195 @@ impl Drop for TerminalGuard {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct View {
-    offset: usize,
-    follow: bool,
-}
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum Popup {
+    Schemes { cursor: usize, filter: String },
+    Devices { cursor: usize, filter: String },
+    History { cursor: usize },
+    Rename { udid: String, text: String },
+    ConfirmDelete,
     Help,
-    Delete,
-    Rename { index: usize, text: String },
 }
+
 enum Discovery {
-    Schemes(Result<Vec<Scheme>>),
+    Schemes(PathBuf, Result<Vec<Scheme>>),
     Destinations(Result<Vec<Destination>>),
     Renamed {
-        index: usize,
+        udid: String,
         name: String,
         result: Result<()>,
     },
 }
 
+/// The job currently running, with what the screen needs to show its progress.
+struct Live {
+    task: Option<Task>,
+    progress: Progress,
+    key: String,
+    started: Instant,
+    destination: String,
+    build_secs: Option<f64>,
+}
+
 struct App {
+    root: PathBuf,
     project: Project,
     schemes: Vec<Scheme>,
     destinations: Vec<Destination>,
     scheme: Option<usize>,
     destination: Option<usize>,
-    scheme_cursor: usize,
-    destination_cursor: usize,
-    scheme_tab: usize,
-    destination_tab: usize,
-    scheme_filter: String,
-    destination_filter: String,
-    focus: usize,
-    last_left: usize,
-    expanded: bool,
-    typing: bool,
-    issues: bool,
-    timestamps: bool,
-    popup: Option<Popup>,
-    message: String,
+    schemes_loaded: bool,
+    destinations_loaded: bool,
+    want_scheme: String,
+    want_destination: String,
     jobs: Vec<Job>,
-    run_cursor: usize,
-    active: Option<Task>,
-    filters: HashMap<(usize, usize), String>,
-    views: HashMap<(usize, usize), View>,
-    initial_scheme: String,
-    initial_destination: String,
-    session_job: bool,
-    discover_tx: mpsc::Sender<Discovery>,
-    discover_rx: mpsc::Receiver<Discovery>,
+    /// Index into `jobs` of the run on screen; 0 is the newest.
+    shown: usize,
+    /// 0 build log, 1 app console.
+    phase: usize,
+    live: Option<Live>,
+    follow: bool,
+    top: usize,
+    problems_only: bool,
+    filter: String,
+    typing: bool,
+    popup: Option<Popup>,
+    toast: Option<(String, Instant)>,
+    tx: mpsc::Sender<Discovery>,
+    rx: mpsc::Receiver<Discovery>,
     background: Vec<thread::JoinHandle<()>>,
-    detail_width: usize,
-    detail_height: usize,
-    pane_areas: [Rect; 5],
+    log_area: Rect,
+    popup_area: Rect,
+    tick: usize,
+    focused: bool,
+    last_check: Instant,
     #[cfg(test)]
     test_mode: bool,
-    #[cfg(test)]
-    stop_requested: bool,
-    #[cfg(test)]
-    pending_rename: Option<(usize, String, Vec<String>)>,
 }
 
 impl App {
-    fn new(project: Project, initial_scheme: Option<&str>) -> Self {
+    fn new(root: PathBuf, project: Project, initial_scheme: Option<&str>) -> Self {
         let prefs = store::load_prefs(&project);
         let jobs = store::load_history(&project);
         let (tx, rx) = mpsc::channel();
-        let sp = project.clone();
-        let stx = tx.clone();
-        let schemes_thread = thread::spawn(move || {
-            let _ = stx.send(Discovery::Schemes(xcode::schemes(&sp)));
-        });
-        let dtx = tx.clone();
-        let destinations_thread = thread::spawn(move || {
-            let _ = dtx.send(Discovery::Destinations(xcode::destinations()));
-        });
-        Self {
+        let mut app = Self {
+            root,
+            want_scheme: initial_scheme.unwrap_or(&prefs.scheme).to_owned(),
+            want_destination: prefs.simulator,
             project,
             schemes: vec![],
             destinations: vec![],
             scheme: None,
             destination: None,
-            scheme_cursor: 0,
-            destination_cursor: 0,
-            scheme_tab: 0,
-            destination_tab: 0,
-            scheme_filter: String::new(),
-            destination_filter: String::new(),
-            focus: 2,
-            last_left: 2,
-            expanded: false,
-            typing: false,
-            issues: false,
-            timestamps: false,
-            popup: None,
-            message: String::new(),
+            schemes_loaded: false,
+            destinations_loaded: false,
             jobs,
-            run_cursor: 0,
-            active: None,
-            filters: HashMap::new(),
-            views: HashMap::new(),
-            initial_scheme: initial_scheme.unwrap_or(&prefs.scheme).to_owned(),
-            initial_destination: prefs.simulator,
-            session_job: false,
-            discover_tx: tx,
-            discover_rx: rx,
-            background: vec![schemes_thread, destinations_thread],
-            detail_width: 1,
-            detail_height: 1,
-            pane_areas: [Rect::default(); 5],
+            shown: 0,
+            phase: 0,
+            live: None,
+            follow: true,
+            top: 0,
+            problems_only: false,
+            filter: String::new(),
+            typing: false,
+            popup: None,
+            toast: None,
+            tx,
+            rx,
+            background: vec![],
+            log_area: Rect::default(),
+            popup_area: Rect::default(),
+            tick: 0,
+            focused: true,
+            last_check: Instant::now(),
             #[cfg(test)]
             test_mode: false,
-            #[cfg(test)]
-            stop_requested: false,
-            #[cfg(test)]
-            pending_rename: None,
+        };
+        app.discover_schemes();
+        app.discover_destinations();
+        app.show_latest();
+        app
+    }
+
+    // ── discovery ────────────────────────────────────────────────────────────
+    fn discover_schemes(&mut self) {
+        #[cfg(test)]
+        if self.test_mode {
+            return;
         }
+        let tx = self.tx.clone();
+        let project = self.project.clone();
+        self.background.push(thread::spawn(move || {
+            let result = xcode::schemes(&project);
+            let _ = tx.send(Discovery::Schemes(project.name, result));
+        }));
     }
-    fn scheme_indices(&self) -> Vec<usize> {
-        self.schemes
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                s.package == (self.scheme_tab == 1) && contains(&s.name, &self.scheme_filter)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-    fn destination_indices(&self) -> Vec<usize> {
-        self.destinations
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| {
-                (self.destination_tab == 0 || d.platform() == PLATFORMS[self.destination_tab])
-                    && contains(
-                        &format!("{} {}", d.name, d.runtime),
-                        &self.destination_filter,
-                    )
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-    fn rows(&self) -> Vec<(usize, usize)> {
-        let mut rows = vec![];
-        for (i, job) in self.jobs.iter().enumerate() {
-            if job.phases.len() > 1 {
-                rows.push((i, 1));
-            }
-            rows.push((i, 0));
+    fn discover_destinations(&mut self) {
+        #[cfg(test)]
+        if self.test_mode {
+            return;
         }
-        rows
+        let tx = self.tx.clone();
+        self.background.push(thread::spawn(move || {
+            let _ = tx.send(Discovery::Destinations(xcode::destinations()));
+        }));
     }
-    fn selected(&self) -> Option<(usize, usize)> {
-        self.rows().get(self.run_cursor).copied()
-    }
-    fn phase_filter(&self) -> String {
-        self.selected()
-            .and_then(|k| self.filters.get(&k))
-            .cloned()
+    /// Follows the project if its workspace/project was created, moved or deleted.
+    fn revalidate_project(&mut self) -> bool {
+        let Ok(found) = Project::find(&self.root) else {
+            return false;
+        };
+        if found == self.project {
+            return false;
+        }
+        let old = self
+            .project
+            .name
+            .file_name()
             .unwrap_or_default()
-    }
-    fn clamp(&mut self) {
-        self.scheme_cursor = self
-            .scheme_cursor
-            .min(self.scheme_indices().len().saturating_sub(1));
-        self.destination_cursor = self
-            .destination_cursor
-            .min(self.destination_indices().len().saturating_sub(1));
-        self.run_cursor = self.run_cursor.min(self.rows().len().saturating_sub(1));
-        if let Some((j, p)) = self.selected() {
-            self.jobs[j].phases[p].ensure_loaded();
+            .to_string_lossy()
+            .into_owned();
+        self.project = found;
+        let prefs = store::load_prefs(&self.project);
+        if !prefs.scheme.is_empty() {
+            self.want_scheme = prefs.scheme;
+        } else if let Some(s) = self.selected_scheme() {
+            self.want_scheme = s.name.clone();
         }
+        if !prefs.simulator.is_empty() {
+            self.want_destination = prefs.simulator;
+        }
+        self.schemes.clear();
+        self.scheme = None;
+        self.schemes_loaded = false;
+        if self.live.is_none() {
+            self.jobs = store::load_history(&self.project);
+            self.show_latest();
+        }
+        self.discover_schemes();
+        self.say(format!(
+            "{old} is gone · now using {}",
+            self.project_label()
+        ));
+        true
+    }
+
+    fn project_label(&self) -> String {
+        self.project
+            .name
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+    fn selected_scheme(&self) -> Option<&Scheme> {
+        self.scheme.and_then(|i| self.schemes.get(i))
+    }
+    fn selected_destination(&self) -> Option<&Destination> {
+        self.destination.and_then(|i| self.destinations.get(i))
+    }
+    fn say(&mut self, text: impl Into<String>) {
+        self.toast = Some((text.into(), Instant::now()));
     }
     fn save_prefs(&mut self) {
         #[cfg(test)]
@@ -275,237 +311,344 @@ impl App {
         }
         let prefs = Prefs {
             scheme: self
-                .scheme
-                .and_then(|i| self.schemes.get(i))
+                .selected_scheme()
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
             simulator: self
-                .destination
-                .and_then(|i| self.destinations.get(i))
+                .selected_destination()
                 .map(|d| d.udid.clone())
                 .unwrap_or_default(),
         };
         if let Err(e) = store::save_prefs(&self.project, &prefs) {
-            self.message = format!("Couldn't remember the selection: {e}");
+            self.say(format!("Couldn't remember the selection: {e}"));
         }
     }
-    fn focusable(&self, n: usize) -> bool {
-        match n {
-            0 | 4 => !self.jobs.is_empty(),
-            1 => true,
-            2 => !self.schemes.is_empty(),
-            3 => !self.destinations.is_empty(),
-            _ => false,
-        }
-    }
-    fn set_focus(&mut self, n: usize) {
-        if self.focusable(n) {
-            self.focus = n;
-            if n != 0 {
-                self.last_left = n;
-            }
-        }
-    }
-    fn next_focus(&mut self, back: bool) {
-        for step in 1..=5 {
-            let n = if back {
-                (self.focus + 5 - step) % 5
-            } else {
-                (self.focus + step) % 5
-            };
-            if self.focusable(n) {
-                self.set_focus(n);
-                break;
-            }
-        }
-    }
+
+    // ── events ───────────────────────────────────────────────────────────────
     fn poll(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(message) = self.discover_rx.try_recv() {
+        while let Ok(message) = self.rx.try_recv() {
             changed = true;
             match message {
-                Discovery::Schemes(Ok(schemes)) => {
-                    self.schemes = schemes;
-                    self.scheme = self
-                        .schemes
-                        .iter()
-                        .position(|s| s.name == self.initial_scheme)
-                        .or_else(|| xcode::default_scheme(&self.project, &self.schemes));
-                    if !self.initial_scheme.is_empty()
-                        && !self.schemes.iter().any(|s| s.name == self.initial_scheme)
-                    {
-                        self.message = format!(
-                            "No scheme {:?}; using {}",
-                            self.initial_scheme,
-                            self.scheme
-                                .map(|i| self.schemes[i].name.as_str())
-                                .unwrap_or("none")
-                        );
+                Discovery::Schemes(container, result) => {
+                    if container != self.project.name {
+                        continue; // the project changed while this ran
                     }
-                    if let Some(i) = self.scheme {
-                        self.scheme_tab = usize::from(self.schemes[i].package);
-                        self.scheme_cursor = self
-                            .scheme_indices()
-                            .iter()
-                            .position(|&j| i == j)
-                            .unwrap_or(0);
-                    }
-                }
-                Discovery::Schemes(Err(e)) => self.message = format!("Couldn't list schemes: {e}"),
-                Discovery::Destinations(Ok(destinations)) => {
-                    self.destinations = destinations;
-                    self.destination = self
-                        .destinations
-                        .iter()
-                        .position(|d| d.udid == self.initial_destination)
-                        .or_else(|| xcode::default_destination(&self.destinations));
-                    self.destination_cursor = self.destination.unwrap_or(0);
-                }
-                Discovery::Destinations(Err(e)) => {
-                    self.message = format!("Couldn't list simulators: {e}")
-                }
-                Discovery::Renamed {
-                    index,
-                    name,
-                    result,
-                } => match result {
-                    Ok(()) => {
-                        if let Some(d) = self.destinations.get_mut(index) {
-                            self.message = format!("Renamed {} to {name}", d.name);
-                            d.name = name;
+                    self.schemes_loaded = true;
+                    match result {
+                        Ok(schemes) => {
+                            let keep = self.selected_scheme().map(|s| s.name.clone());
+                            self.schemes = schemes;
+                            let want = keep.unwrap_or_else(|| self.want_scheme.clone());
+                            self.scheme = self
+                                .schemes
+                                .iter()
+                                .position(|s| s.name == want)
+                                .or_else(|| xcode::default_scheme(&self.project, &self.schemes));
                         }
+                        Err(e) => self.say(format!("Couldn't list schemes: {e}")),
                     }
-                    Err(e) => self.message = format!("Couldn't rename the simulator: {e}"),
+                }
+                Discovery::Destinations(result) => {
+                    self.destinations_loaded = true;
+                    match result {
+                        Ok(list) => {
+                            let keep = self
+                                .selected_destination()
+                                .map(|d| d.udid.clone())
+                                .unwrap_or_else(|| self.want_destination.clone());
+                            self.destinations = list;
+                            self.destination = self
+                                .destinations
+                                .iter()
+                                .position(|d| d.udid == keep)
+                                .or_else(|| xcode::default_destination(&self.destinations));
+                        }
+                        Err(e) => self.say(format!("Couldn't list devices: {e}")),
+                    }
+                }
+                Discovery::Renamed { udid, name, result } => match result {
+                    Ok(()) => {
+                        if let Some(d) = self.destinations.iter_mut().find(|d| d.udid == udid) {
+                            d.name = name.clone();
+                        }
+                        self.say(format!("Renamed to {name}"));
+                    }
+                    Err(e) => self.say(format!("Couldn't rename: {e}")),
                 },
             }
         }
         let events: Vec<Event> = self
-            .active
+            .live
             .as_ref()
-            .map(|t| t.events.try_iter().collect())
+            .and_then(|l| l.task.as_ref())
+            .map(|t| t.events.try_iter().take(20_000).collect())
             .unwrap_or_default();
         changed |= !events.is_empty();
-        let mut finished = false;
-        for e in events {
-            if let Some(job) = self.jobs.first_mut() {
-                match e {
-                    Event::Line(line) => {
-                        job.line(crate::job::strip_paths(&line, &self.project.name))
+        for event in events {
+            self.apply(event);
+        }
+        if self.live.is_none()
+            && self.popup.is_none()
+            && self.last_check.elapsed() >= Duration::from_secs(3)
+        {
+            self.last_check = Instant::now();
+            changed |= self.revalidate_project();
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(6))
+        {
+            self.toast = None;
+            changed = true;
+        }
+        changed
+    }
+
+    fn apply(&mut self, event: Event) {
+        if self.live.is_none() || self.jobs.is_empty() {
+            return;
+        }
+        let container = self.project.name.clone();
+        match event {
+            Event::Line(line) => {
+                let line = job::strip_paths(&line, &container);
+                if let Some(live) = self.live.as_mut() {
+                    live.progress.line(&line);
+                }
+                self.jobs[0].line(line);
+            }
+            Event::Console(line) => self.jobs[0].line(job::strip_paths(&line, &container)),
+            Event::State(state) => match state.as_str() {
+                "installing" => {
+                    self.jobs[0].build_finished();
+                    let Some(live) = self.live.as_mut() else {
+                        return;
+                    };
+                    let secs = live.started.elapsed().as_secs_f64();
+                    live.build_secs = Some(secs);
+                    let estimate = Estimate {
+                        tasks: live.progress.tasks,
+                        seconds: secs,
+                    };
+                    live.progress.set_stage(Stage::Installing);
+                    let key = live.key.clone();
+                    self.remember(&key, estimate);
+                }
+                "launching" => {
+                    self.jobs[0].status = state;
+                    if let Some(live) = self.live.as_mut() {
+                        live.progress.set_stage(Stage::Launching);
                     }
-                    Event::Console(line) => {
-                        job.line(crate::job::strip_paths(&line, &self.project.name))
+                }
+                _ => self.jobs[0].status = state,
+            },
+            Event::Attached(app) => {
+                self.jobs[0].line(format!("▸ Launched {app}"));
+                self.jobs[0].attach(app.clone());
+                if self.shown == 0 {
+                    self.phase = 1;
+                    self.follow = true;
+                }
+                let target = self
+                    .live
+                    .as_ref()
+                    .map(|l| l.destination.clone())
+                    .unwrap_or_default();
+                self.notify(&format!("Running on {target}"), &app);
+            }
+            Event::Done { code, stopped } => {
+                self.jobs[0].finish(code, stopped);
+                let Some(live) = self.live.take() else { return };
+                let (kind, outcome, attached) = {
+                    let j = &self.jobs[0];
+                    (j.kind.clone(), j.outcome.clone(), j.attached.is_some())
+                };
+                if code == 0 && !stopped && kind != "run" && kind != "clean" {
+                    self.remember(
+                        &live.key,
+                        Estimate {
+                            tasks: live.progress.tasks,
+                            seconds: live.started.elapsed().as_secs_f64(),
+                        },
+                    );
+                }
+                #[cfg(test)]
+                let skip_save = self.test_mode;
+                #[cfg(not(test))]
+                let skip_save = false;
+                if !skip_save && let Err(e) = store::save_job(&self.project, &self.jobs[0]) {
+                    self.say(format!("Couldn't save the run: {e}"));
+                }
+                if let Some(task) = live.task {
+                    task.wait();
+                }
+                if outcome == "failed" {
+                    if self.shown == 0 {
+                        self.phase = 0;
+                        self.follow = true;
+                        self.top = 0;
+                        self.problems_only = self.jobs[0].phases[0].counts().0 > 0;
                     }
-                    Event::Attached(app) => {
-                        job.line(format!(
-                            "▸ Launched {app}. Its output is in the console row above."
-                        ));
-                        job.attach(app);
-                        self.run_cursor = 0;
+                    let stale = self.jobs[0].phases[0].lines.iter().rev().take(40).any(|l| {
+                        l.contains("does not contain a scheme named")
+                            || l.contains("does not exist")
+                    });
+                    if stale && !self.revalidate_project() {
+                        self.discover_schemes();
                     }
-                    Event::State(state) => {
-                        if state == "installing" {
-                            job.build_finished();
-                        } else {
-                            job.status = state;
-                        }
-                    }
-                    Event::Done { code, stopped } => {
-                        job.finish(code, stopped);
-                        if let Err(e) = store::save_job(&self.project, job) {
-                            self.message = format!("Couldn't save the run: {e}");
-                        }
-                        finished = true;
-                    }
+                }
+                if live.started.elapsed() > Duration::from_secs(20) && !attached {
+                    let title = format!("{} {outcome}", capitalize(&kind));
+                    self.notify(&title, &self.project_label());
                 }
             }
         }
-        if finished && let Some(task) = self.active.take() {
-            task.wait();
-        }
-        self.clamp();
-        changed
     }
-    fn busy(&self) -> bool {
-        self.jobs.first().is_some_and(|j| j.outcome == "running")
-    }
-    fn start(&mut self, kind: &str) {
-        if self.busy() {
-            self.message = "Busy — press x to stop".into();
-            return;
-        }
-        if kind != "resolve" && (self.scheme.is_none() || self.destination.is_none()) {
-            self.message = "Pick a scheme (2) and a destination (3) first".into();
-            return;
-        }
-        let scheme = self
-            .scheme
-            .map(|i| self.schemes[i].clone())
-            .unwrap_or(Scheme {
-                name: String::new(),
-                package: false,
-            });
-        let destination = self
-            .destination
-            .map(|i| self.destinations[i].clone())
-            .unwrap_or(Destination {
-                name: "My Mac".into(),
-                runtime: "macOS".into(),
-                state: String::new(),
-                udid: "mac".into(),
-                device: false,
-            });
-        self.filters = std::mem::take(&mut self.filters)
-            .into_iter()
-            .map(|((j, p), v)| ((j + 1, p), v))
-            .collect();
-        self.views = std::mem::take(&mut self.views)
-            .into_iter()
-            .map(|((j, p), v)| ((j + 1, p), v))
-            .collect();
-        self.jobs.insert(0, Job::new(kind));
-        self.jobs.truncate(50);
-        self.run_cursor = 0;
-        self.session_job = true;
-        self.message.clear();
+
+    fn remember(&mut self, key: &str, estimate: Estimate) {
         #[cfg(test)]
         if self.test_mode {
-            self.stop_requested = false;
             return;
         }
-        self.active = Some(runtime::start(
+        let _ = store::save_estimate(&self.project, key, estimate);
+    }
+
+    /// A macOS notification, only when the terminal is in the background.
+    fn notify(&self, title: &str, body: &str) {
+        #[cfg(test)]
+        if self.test_mode {
+            return;
+        }
+        if self.focused {
+            return;
+        }
+        let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            quote(body),
+            quote(title)
+        );
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|mut child| thread::spawn(move || child.wait()));
+    }
+
+    fn busy(&self) -> bool {
+        self.live.is_some()
+    }
+
+    fn start(&mut self, kind: &str) {
+        if self.busy() {
+            self.say("Already running · x stops it");
+            return;
+        }
+        if !self.project.name.exists() {
+            self.revalidate_project();
+            if !self.project.name.exists() {
+                self.say(format!("{} no longer exists", self.project_label()));
+            }
+            return;
+        }
+        if kind != "resolve" {
+            if self.selected_scheme().is_none() {
+                self.open_schemes();
+                return;
+            }
+            if self.selected_destination().is_none() {
+                self.open_devices();
+                return;
+            }
+        }
+        let scheme = self.selected_scheme().cloned().unwrap_or(Scheme {
+            name: String::new(),
+            package: false,
+        });
+        let destination = self.selected_destination().cloned().unwrap_or(Destination {
+            name: "My Mac".into(),
+            runtime: "macOS".into(),
+            udid: "mac".into(),
+            ..Destination::default()
+        });
+        let key = format!(
+            "{}|{}|{}",
+            if kind == "run" { "build" } else { kind },
+            scheme.name,
+            destination.udid
+        );
+        #[cfg(test)]
+        let estimate = None;
+        #[cfg(not(test))]
+        let estimate = store::load_estimate(&self.project, &key);
+        self.jobs.insert(0, Job::new(kind));
+        self.jobs.truncate(50);
+        self.toast = None;
+        self.show_latest();
+        #[cfg(test)]
+        let task = if self.test_mode {
+            None
+        } else {
+            Some(runtime::start(
+                kind,
+                self.project.clone(),
+                scheme,
+                destination.clone(),
+            ))
+        };
+        #[cfg(not(test))]
+        let task = Some(runtime::start(
             kind,
             self.project.clone(),
             scheme,
-            destination,
+            destination.clone(),
         ));
+        self.live = Some(Live {
+            task,
+            progress: Progress::new(estimate),
+            key,
+            started: Instant::now(),
+            destination: destination.name,
+            build_secs: None,
+        });
     }
-    fn shutdown(&mut self) {
-        if let Some(task) = self.active.take() {
+
+    fn stop(&mut self) {
+        if let Some(task) = self.live.as_ref().and_then(|l| l.task.as_ref()) {
             task.cancel();
-            // Keep draining until completion so a bounded output channel cannot deadlock shutdown.
+            self.say("Stopping…");
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(live) = self.live.take()
+            && let Some(task) = live.task
+        {
+            task.cancel();
+            // Drain to completion so a bounded channel cannot deadlock shutdown.
+            let mut code = 130;
             while let Ok(e) = task.events.recv() {
                 if let Some(job) = self.jobs.first_mut() {
                     match e {
-                        Event::Line(s) => job.line(crate::job::strip_paths(&s, &self.project.name)),
-                        Event::Console(s) => {
-                            job.line(crate::job::strip_paths(&s, &self.project.name))
+                        Event::Line(s) | Event::Console(s) => {
+                            job.line(job::strip_paths(&s, &self.project.name))
                         }
-                        Event::Attached(a) => {
-                            job.line(format!(
-                                "▸ Launched {a}. Its output is in the console row above."
-                            ));
-                            job.attach(a);
-                        }
+                        Event::Attached(a) => job.attach(a),
                         Event::State(s) => job.status = s,
-                        Event::Done { code, stopped: _ } => {
-                            job.finish(code, true);
+                        Event::Done { code: c, .. } => {
+                            code = c;
                             break;
                         }
                     }
                 }
             }
             task.wait();
-            if let Some(job) = self.jobs.first() {
+            if let Some(job) = self.jobs.first_mut() {
+                job.finish(code, true);
                 let _ = store::save_job(&self.project, job);
             }
         }
@@ -513,99 +656,141 @@ impl App {
             let _ = handle.join();
         }
     }
-    fn raw_lines(&self) -> Vec<String> {
-        let Some((j, p)) = self.selected() else {
-            return vec![];
-        };
-        let phase = &self.jobs[j].phases[p];
-        let filter = self.filters.get(&(j, p)).map(String::as_str).unwrap_or("");
-        if !filter.is_empty() {
-            phase
-                .lines
-                .iter()
-                .filter(|s| contains(s, filter))
-                .cloned()
-                .collect()
-        } else if self.issues {
-            phase.issues()
-        } else {
-            phase.lines.clone()
+
+    // ── log view ─────────────────────────────────────────────────────────────
+    fn show_latest(&mut self) {
+        self.show(0);
+    }
+    fn show(&mut self, index: usize) {
+        self.shown = index.min(self.jobs.len().saturating_sub(1));
+        self.phase = self.jobs.get(self.shown).map_or(0, |j| {
+            usize::from(j.phases.len() > 1 && j.outcome != "failed")
+        });
+        self.follow = true;
+        self.top = 0;
+        self.filter.clear();
+        self.problems_only = self.jobs.get(self.shown).is_some_and(|j| {
+            j.outcome == "failed" && j.phases.first().is_some_and(|p| p.counts().0 > 0)
+        });
+        self.load_shown();
+    }
+    fn load_shown(&mut self) {
+        let phase = self.phase;
+        if let Some(job) = self.jobs.get_mut(self.shown)
+            && let Some(p) = job.phases.get_mut(phase)
+        {
+            p.ensure_loaded();
         }
     }
-    fn line_groups(&self) -> Vec<Vec<String>> {
-        let console = self.selected().is_some_and(|(_, p)| p == 1);
-        self.raw_lines()
-            .iter()
-            .map(|s| {
-                let s = s.trim_end_matches('\r').rsplit('\r').next().unwrap_or("");
-                let s = if console && !self.timestamps {
-                    strip_time(s)
-                } else {
-                    s
-                };
-                wrap(s, self.detail_width)
-            })
-            .collect()
+    fn shown_phase(&self) -> Option<&job::Phase> {
+        self.jobs.get(self.shown)?.phases.get(self.phase)
     }
-    fn scroll(&mut self, delta: isize, end: Option<bool>) {
-        let Some(key) = self.selected() else { return };
-        let groups = self.line_groups();
-        let tail = tail_offset(&groups, self.detail_height);
-        let view = self.views.entry(key).or_insert(View {
-            offset: tail,
-            follow: true,
-        });
-        let mut current = if view.follow {
-            tail
-        } else {
-            view.offset.min(tail)
+    /// Line numbers visible under the current view: everything, problems
+    /// (errors first), or filter matches. `None` means every line.
+    fn indices(&self) -> Option<Vec<usize>> {
+        let phase = self.shown_phase()?;
+        if !self.filter.is_empty() {
+            let needle = self.filter.to_lowercase();
+            return Some(
+                phase
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect(),
+            );
+        }
+        if self.problems_only {
+            let issues = phase.issue_indices();
+            let (errors, warnings): (Vec<usize>, Vec<usize>) = issues
+                .iter()
+                .partition(|&&i| job::kind(&phase.lines[i]) == "error");
+            return Some(errors.into_iter().chain(warnings).collect());
+        }
+        None
+    }
+    fn visible_len(&self, indices: &Option<Vec<usize>>) -> usize {
+        match indices {
+            Some(v) => v.len(),
+            None => self.shown_phase().map_or(0, |p| p.lines.len()),
+        }
+    }
+    fn line_at<'a>(&'a self, indices: &Option<Vec<usize>>, n: usize) -> &'a str {
+        let Some(phase) = self.shown_phase() else {
+            return "";
         };
-        if let Some(bottom) = end {
-            current = if bottom { tail } else { 0 };
-        } else if delta != 0 {
-            let mut remaining = delta.unsigned_abs();
-            let mut moved = false;
-            while remaining > 0 || !moved {
-                let next = if delta > 0 {
-                    if current >= tail {
-                        break;
-                    }
-                    current + 1
-                } else {
-                    if current == 0 {
-                        break;
-                    }
-                    current - 1
-                };
-                let cost = groups[if delta > 0 { current } else { next }].len();
-                if moved && cost > remaining {
-                    break;
-                }
-                current = next;
-                remaining = remaining.saturating_sub(cost);
-                moved = true;
+        let i = match indices {
+            Some(v) => v[n],
+            None => n,
+        };
+        clean(&phase.lines[i])
+    }
+    /// First visible line when following the end, found by wrapping backwards
+    /// only as many lines as fit.
+    fn tail_top(&self, indices: &Option<Vec<usize>>) -> usize {
+        let len = self.visible_len(indices);
+        let width = self.log_area.width.max(1) as usize;
+        let height = self.log_area.height.max(1) as usize;
+        let mut rows = 0;
+        let mut top = len;
+        while top > 0 {
+            let r = wrapped_rows(self.line_at(indices, top - 1), width);
+            if rows > 0 && rows + r > height {
+                break;
+            }
+            rows += r;
+            top -= 1;
+            if rows >= height {
+                break;
             }
         }
-        view.offset = current.min(tail);
-        view.follow = view.offset == tail;
+        top
     }
+    fn scroll(&mut self, delta: isize) {
+        let indices = self.indices();
+        let tail = self.tail_top(&indices);
+        let current = if self.follow {
+            tail
+        } else {
+            self.top.min(tail)
+        };
+        let next = current.saturating_add_signed(delta).min(tail);
+        self.top = next;
+        self.follow = next >= tail;
+    }
+    fn jump(&mut self, end: bool) {
+        self.follow = end;
+        self.top = 0;
+    }
+    fn reset_view(&mut self) {
+        self.follow = true;
+        self.top = 0;
+    }
+
     fn edit<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
-        if self.selected().is_none() {
-            self.message = "No run to open".into();
+        let indices = self.indices();
+        let len = self.visible_len(&indices);
+        if len == 0 {
+            self.say("Nothing to open");
             return Ok(());
         }
+        let text: String = (0..len)
+            .map(|n| format!("{}\n", self.line_at(&indices, n)))
+            .collect();
         let path = std::env::temp_dir().join(format!(
             "xctui-{}-{}.log",
             std::process::id(),
             chrono::Local::now().timestamp_nanos_opt().unwrap_or(0)
         ));
-        if let Err(e) = std::fs::write(&path, format!("{}\n", self.raw_lines().join("\n"))) {
-            self.message = format!("Couldn't write the log: {e}");
+        if let Err(e) = std::fs::write(&path, text) {
+            self.say(format!("Couldn't write the log: {e}"));
             return Ok(());
         }
         terminal::disable_raw_mode()?;
         execute!(
             io::stdout(),
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen,
             crossterm::cursor::Show
@@ -613,36 +798,92 @@ impl App {
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
             .unwrap_or_else(|_| "vi".into());
-        let result = Command::new(editor).arg(&path).status();
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // $EDITOR may carry arguments ("code -w").
+        let mut parts = editor.split_whitespace();
+        let result = Command::new(parts.next().unwrap_or("vi"))
+            .args(parts)
+            .arg(&path)
+            .status();
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange
+        )?;
         terminal::enable_raw_mode()?;
         terminal.clear()?;
         let _ = std::fs::remove_file(path);
         match result {
             Ok(s) if s.success() => (),
-            Ok(s) => self.message = format!("Editor: {s}"),
-            Err(e) => self.message = format!("Editor: {e}"),
-        };
+            Ok(s) => self.say(format!("Editor: {s}")),
+            Err(e) => self.say(format!("Editor: {e}")),
+        }
         Ok(())
     }
-    fn delete_history(&self) -> Result<()> {
-        #[cfg(test)]
-        if self.test_mode {
-            return Ok(());
+
+    // ── pickers ──────────────────────────────────────────────────────────────
+    fn open_schemes(&mut self) {
+        if !self.schemes_loaded {
+            self.say("Still looking for schemes…");
         }
-        store::delete_history(&self.project)
+        let cursor = self
+            .scheme_rows("")
+            .iter()
+            .position(|&i| Some(i) == self.scheme)
+            .unwrap_or(0);
+        self.popup = Some(Popup::Schemes {
+            cursor,
+            filter: String::new(),
+        });
     }
-    fn filter_mut(&mut self) -> Option<&mut String> {
-        match self.focus {
-            2 => Some(&mut self.scheme_filter),
-            3 => Some(&mut self.destination_filter),
-            0 => {
-                let key = self.selected()?;
-                Some(self.filters.entry(key).or_default())
-            }
-            _ => None,
+    fn open_devices(&mut self) {
+        if !self.destinations_loaded {
+            self.say("Still looking for devices…");
         }
+        let cursor = self
+            .device_rows("")
+            .iter()
+            .position(|&i| Some(i) == self.destination)
+            .unwrap_or(0);
+        self.popup = Some(Popup::Devices {
+            cursor,
+            filter: String::new(),
+        });
     }
+    fn scheme_rows(&self, filter: &str) -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..self.schemes.len())
+            .filter(|&i| contains(&self.schemes[i].name, filter))
+            .collect();
+        rows.sort_by_key(|&i| self.schemes[i].package);
+        rows
+    }
+    /// Devices first, then My Mac, then simulators with booted ones first.
+    fn device_rows(&self, filter: &str) -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..self.destinations.len())
+            .filter(|&i| {
+                let d = &self.destinations[i];
+                contains(&format!("{} {}", d.name, d.runtime), filter)
+            })
+            .collect();
+        rows.sort_by_key(|&i| {
+            let d = &self.destinations[i];
+            (
+                if d.device {
+                    0
+                } else if d.is_mac() {
+                    1
+                } else if d.state == "Booted" {
+                    2
+                } else {
+                    3
+                },
+                i,
+            )
+        });
+        rows
+    }
+
+    // ── input ────────────────────────────────────────────────────────────────
     fn key<B: ratatui::backend::Backend>(
         &mut self,
         key: KeyEvent,
@@ -651,315 +892,261 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
-        if let Some(popup) = self.popup.clone() {
-            match popup {
-                Popup::Help => self.popup = None,
-                Popup::Delete => match key.code {
-                    KeyCode::Char('y') => {
-                        self.popup = None;
-                        match self.delete_history() {
-                            Ok(()) => {
-                                let n = self.jobs.len() - usize::from(self.busy());
-                                self.jobs.truncate(usize::from(self.busy()));
-                                self.run_cursor = 0;
-                                self.filters.clear();
-                                self.views.clear();
-                                self.session_job = self.busy();
-                                if !self.focusable(self.focus) {
-                                    self.set_focus(1);
-                                }
-                                self.message =
-                                    format!("Deleted {n} run{}", if n == 1 { "" } else { "s" });
-                            }
-                            Err(e) => self.message = format!("Couldn't delete the runs: {e}"),
-                        }
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc => self.popup = None,
-                    _ => (),
-                },
-                Popup::Rename { index, mut text } => match key.code {
-                    KeyCode::Esc => self.popup = None,
-                    KeyCode::Enter => {
-                        self.popup = None;
-                        let name = text.trim().to_string();
-                        let d = &self.destinations[index];
-                        if !name.is_empty() && name != d.name {
-                            let udid = d.udid.clone();
-                            #[cfg(test)]
-                            if self.test_mode {
-                                self.pending_rename = Some((
-                                    index,
-                                    name.clone(),
-                                    vec![
-                                        "xcrun".into(),
-                                        "simctl".into(),
-                                        "rename".into(),
-                                        udid,
-                                        name,
-                                    ],
-                                ));
-                                return Ok(false);
-                            }
-                            let tx = self.discover_tx.clone();
-                            self.background.push(thread::spawn(move || {
-                                let result = Command::new("xcrun")
-                                    .args(["simctl", "rename", &udid, &name])
-                                    .output()
-                                    .context("xcrun simctl rename")
-                                    .and_then(|o| {
-                                        if o.status.success() {
-                                            Ok(())
-                                        } else {
-                                            bail!(
-                                                "{}: {}",
-                                                o.status,
-                                                String::from_utf8_lossy(&o.stderr).trim()
-                                            )
-                                        }
-                                    });
-                                let _ = tx.send(Discovery::Renamed {
-                                    index,
-                                    name,
-                                    result,
-                                });
-                            }));
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        text.pop();
-                        self.popup = Some(Popup::Rename { index, text });
-                    }
-                    KeyCode::Char(c) => {
-                        text.push(c);
-                        self.popup = Some(Popup::Rename { index, text });
-                    }
-                    _ => (),
-                },
-            }
+        if self.popup.is_some() {
+            self.popup_key(key);
             return Ok(false);
         }
         if self.typing {
             match key.code {
                 KeyCode::Enter => self.typing = false,
                 KeyCode::Esc => {
-                    if let Some(f) = self.filter_mut() {
-                        f.clear();
-                    }
+                    self.filter.clear();
                     self.typing = false;
                 }
                 KeyCode::Backspace => {
-                    if let Some(f) = self.filter_mut() {
-                        f.pop();
-                    }
+                    self.filter.pop();
                 }
-                KeyCode::Char(c) => {
-                    if let Some(f) = self.filter_mut() {
-                        f.push(c);
-                    }
-                }
+                KeyCode::Char(c) if !ctrl => self.filter.push(c),
                 _ => (),
             }
-            if let Some(k) = self.selected() {
-                self.views.remove(&k);
-            }
-            self.clamp();
+            self.reset_view();
             return Ok(false);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        let half = (self.log_area.height / 2).max(1) as isize;
+        if ctrl {
             match key.code {
-                KeyCode::Char('d') => self.scroll((self.detail_height / 2).max(1) as isize, None),
-                KeyCode::Char('u') => {
-                    self.scroll(-((self.detail_height / 2).max(1) as isize), None)
-                }
+                KeyCode::Char('d') => self.scroll(half),
+                KeyCode::Char('u') => self.scroll(-half),
                 _ => (),
-            };
+            }
             return Ok(false);
         }
         match key.code {
             KeyCode::Char('q') => return Ok(true),
-            KeyCode::Char('b') => self.start("build"),
             KeyCode::Char('r') => self.start("run"),
+            KeyCode::Char('b') => self.start("build"),
             KeyCode::Char('t') => self.start("test"),
             KeyCode::Char('c') => self.start("clean"),
             KeyCode::Char('p') => self.start("resolve"),
-            KeyCode::Char('x') => {
-                #[cfg(test)]
-                {
-                    self.stop_requested = true;
-                }
-                if let Some(task) = &self.active {
-                    task.cancel();
+            KeyCode::Char('x') => self.stop(),
+            KeyCode::Char('s') => {
+                if self.busy() {
+                    self.say("Stop the current run to change the scheme");
+                } else {
+                    self.open_schemes();
                 }
             }
-            KeyCode::Char(c @ '0'..='4') => self.set_focus(c.to_digit(10).unwrap() as usize),
-            KeyCode::Tab => self.next_focus(key.modifiers.contains(KeyModifiers::SHIFT)),
-            KeyCode::BackTab => self.next_focus(true),
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-            KeyCode::PageDown => self.move_cursor(self.detail_height as isize),
-            KeyCode::PageUp => self.move_cursor(-(self.detail_height as isize)),
-            KeyCode::Char('g') | KeyCode::Home => self.jump(false),
-            KeyCode::Char('G') | KeyCode::End => self.jump(true),
-            KeyCode::Enter | KeyCode::Char(' ') => match self.focus {
-                2 | 3 if self.busy() => self.message = "Busy — press x to stop".into(),
-                2 => {
-                    self.scheme = self.scheme_indices().get(self.scheme_cursor).copied();
-                    self.save_prefs();
+            KeyCode::Char('d') => {
+                if self.busy() {
+                    self.say("Stop the current run to change the device");
+                } else {
+                    self.open_devices();
                 }
-                3 => {
-                    self.destination = self
-                        .destination_indices()
-                        .get(self.destination_cursor)
-                        .copied();
-                    self.save_prefs();
+            }
+            KeyCode::Char('h') => {
+                if self.jobs.is_empty() {
+                    self.say("No runs yet");
+                } else {
+                    self.popup = Some(Popup::History { cursor: self.shown });
                 }
-                _ => (),
-            },
-            KeyCode::Char('R') if self.focus == 3 => {
-                if let Some(&i) = self.destination_indices().get(self.destination_cursor) {
-                    let d = &self.destinations[i];
-                    if !d.is_mac() && !d.device {
-                        self.popup = Some(Popup::Rename {
-                            index: i,
-                            text: d.name.clone(),
-                        });
-                    }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let phases = self.jobs.get(self.shown).map_or(0, |j| j.phases.len());
+                if phases > 1 {
+                    self.phase = 1 - self.phase;
+                    self.reset_view();
+                    self.load_shown();
+                } else {
+                    self.say("The app console appears once the app runs");
                 }
+            }
+            KeyCode::Char('i') => {
+                self.problems_only = !self.problems_only;
+                self.reset_view();
             }
             KeyCode::Char('/') => {
-                if self.filter_mut().is_some() {
-                    self.typing = true;
-                }
+                self.typing = true;
+                self.reset_view();
             }
             KeyCode::Esc => {
-                if let Some(f) = self.filter_mut() {
-                    f.clear();
-                }
-                self.clamp();
-            }
-            KeyCode::Char(c @ ('[' | ']')) => {
-                let backwards = c == '[';
-                match self.focus {
-                    2 => {
-                        self.scheme_tab = (self.scheme_tab + 1) % 2;
-                        self.scheme_cursor = 0;
-                    }
-                    3 => {
-                        self.destination_tab = (self.destination_tab
-                            + if backwards { PLATFORMS.len() - 1 } else { 1 })
-                            % PLATFORMS.len();
-                        self.destination_cursor = 0;
-                    }
-                    _ => (),
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.reset_view();
+                } else if self.shown != 0 {
+                    self.show_latest();
                 }
             }
-            KeyCode::Char('+') => self.expanded = true,
-            KeyCode::Char('_') => self.expanded = false,
-            KeyCode::Char('i') => {
-                self.issues = !self.issues;
-                if let Some(k) = self.selected() {
-                    self.views.remove(&k);
-                }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.scroll(self.log_area.height.max(1) as isize)
             }
-            KeyCode::Char('s') => {
-                self.timestamps = !self.timestamps;
-            }
+            KeyCode::PageUp => self.scroll(-(self.log_area.height.max(1) as isize)),
+            KeyCode::Char('g') | KeyCode::Home => self.jump(false),
+            KeyCode::Char('G') | KeyCode::End => self.jump(true),
             KeyCode::Char('e') => self.edit(terminal)?,
-            KeyCode::Char('D') => {
-                let n = self.jobs.len() - usize::from(self.busy());
-                if n > 0 {
-                    self.popup = Some(Popup::Delete);
-                } else {
-                    self.message = if self.busy() {
-                        "Only the running job is left; x stops it"
-                    } else {
-                        "No runs to delete"
-                    }
-                    .into();
-                }
-            }
             KeyCode::Char('?') | KeyCode::F(1) => self.popup = Some(Popup::Help),
             _ => (),
         }
-        self.clamp();
         Ok(false)
     }
-    fn mouse(&mut self, event: MouseEvent) {
-        if self.popup.is_some() || self.typing {
+
+    fn popup_key(&mut self, key: KeyEvent) {
+        let Some(popup) = self.popup.take() else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        self.popup = match popup {
+            Popup::Help => None,
+            Popup::ConfirmDelete => {
+                if key.code == KeyCode::Char('y') {
+                    self.delete_history();
+                }
+                None
+            }
+            Popup::Rename { udid, mut text } => match key.code {
+                KeyCode::Esc => None,
+                KeyCode::Enter => {
+                    self.rename(udid, text.trim().to_owned());
+                    None
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                    Some(Popup::Rename { udid, text })
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    text.push(c);
+                    Some(Popup::Rename { udid, text })
+                }
+                _ => Some(Popup::Rename { udid, text }),
+            },
+            Popup::History { cursor } => {
+                let last = self.jobs.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => None,
+                    KeyCode::Enter => {
+                        self.show(cursor);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => Some(Popup::History {
+                        cursor: (cursor + 1).min(last),
+                    }),
+                    KeyCode::Up | KeyCode::Char('k') => Some(Popup::History {
+                        cursor: cursor.saturating_sub(1),
+                    }),
+                    KeyCode::Char('D') => {
+                        if self.jobs.len() > usize::from(self.busy()) {
+                            Some(Popup::ConfirmDelete)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => Some(Popup::History { cursor }),
+                }
+            }
+            Popup::Schemes { cursor, filter } => {
+                let rows = self.scheme_rows(&filter);
+                match list_key(key, cursor, filter, rows.len()) {
+                    ListKey::Close => None,
+                    ListKey::Pick(n) => {
+                        if let Some(&i) = rows.get(n) {
+                            self.scheme = Some(i);
+                            self.save_prefs();
+                        }
+                        None
+                    }
+                    ListKey::Stay(cursor, filter) => Some(Popup::Schemes { cursor, filter }),
+                }
+            }
+            Popup::Devices { cursor, filter } => {
+                let rows = self.device_rows(&filter);
+                if ctrl && key.code == KeyCode::Char('r') {
+                    match rows.get(cursor).map(|&i| &self.destinations[i]) {
+                        Some(d) if !d.device && !d.is_mac() => Some(Popup::Rename {
+                            udid: d.udid.clone(),
+                            text: d.name.clone(),
+                        }),
+                        _ => Some(Popup::Devices { cursor, filter }),
+                    }
+                } else {
+                    match list_key(key, cursor, filter, rows.len()) {
+                        ListKey::Close => None,
+                        ListKey::Pick(n) => {
+                            if let Some(&i) = rows.get(n) {
+                                self.destination = Some(i);
+                                self.save_prefs();
+                            }
+                            None
+                        }
+                        ListKey::Stay(cursor, filter) => Some(Popup::Devices { cursor, filter }),
+                    }
+                }
+            }
+        };
+    }
+
+    fn rename(&mut self, udid: String, name: String) {
+        if name.is_empty() {
             return;
         }
-        let delta = match event.kind {
+        #[cfg(test)]
+        if self.test_mode {
+            return;
+        }
+        let tx = self.tx.clone();
+        self.background.push(thread::spawn(move || {
+            let result = xcode::rename_simulator(&udid, &name);
+            let _ = tx.send(Discovery::Renamed { udid, name, result });
+        }));
+    }
+
+    fn delete_history(&mut self) {
+        #[cfg(test)]
+        let result = if self.test_mode {
+            Ok(())
+        } else {
+            store::delete_history(&self.project)
+        };
+        #[cfg(not(test))]
+        let result = store::delete_history(&self.project);
+        match result {
+            Ok(()) => {
+                let keep = usize::from(self.busy());
+                let n = self.jobs.len() - keep;
+                self.jobs.truncate(keep);
+                self.show_latest();
+                self.say(format!("Deleted {}", job::count(n, "run")));
+            }
+            Err(e) => self.say(format!("Couldn't delete the runs: {e}")),
+        }
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        let delta: isize = match event.kind {
             MouseEventKind::ScrollUp => -3,
             MouseEventKind::ScrollDown => 3,
             _ => return,
         };
-        let Some(pane) = self.pane_areas.iter().position(|area| {
-            event.column >= area.x
-                && event.column < area.right()
-                && event.row >= area.y
-                && event.row < area.bottom()
-        }) else {
-            return;
-        };
-        if !self.focusable(pane) {
+        if self.popup.is_some() {
+            let inside = contains_point(self.popup_area, event.column, event.row);
+            if inside {
+                let code = if delta < 0 {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                };
+                for _ in 0..delta.unsigned_abs() {
+                    self.popup_key(KeyEvent::from(code));
+                }
+            }
             return;
         }
-        self.set_focus(pane);
-        self.move_cursor(delta);
-        self.clamp();
-    }
-    fn move_cursor(&mut self, delta: isize) {
-        match self.focus {
-            2 => {
-                self.scheme_cursor = self
-                    .scheme_cursor
-                    .saturating_add_signed(delta)
-                    .min(self.scheme_indices().len().saturating_sub(1))
-            }
-            3 => {
-                self.destination_cursor = self
-                    .destination_cursor
-                    .saturating_add_signed(delta)
-                    .min(self.destination_indices().len().saturating_sub(1))
-            }
-            4 => {
-                self.run_cursor = self
-                    .run_cursor
-                    .saturating_add_signed(delta)
-                    .min(self.rows().len().saturating_sub(1))
-            }
-            0 => self.scroll(delta, None),
-            _ => (),
-        }
-    }
-    fn jump(&mut self, bottom: bool) {
-        match self.focus {
-            2 => {
-                self.scheme_cursor = if bottom {
-                    self.scheme_indices().len().saturating_sub(1)
-                } else {
-                    0
-                }
-            }
-            3 => {
-                self.destination_cursor = if bottom {
-                    self.destination_indices().len().saturating_sub(1)
-                } else {
-                    0
-                }
-            }
-            4 => {
-                self.run_cursor = if bottom {
-                    self.rows().len().saturating_sub(1)
-                } else {
-                    0
-                }
-            }
-            0 => self.scroll(0, Some(bottom)),
-            _ => (),
+        if contains_point(self.log_area, event.column, event.row) {
+            self.scroll(delta);
         }
     }
 }
@@ -969,48 +1156,100 @@ impl Drop for App {
     }
 }
 
+enum ListKey {
+    Close,
+    Pick(usize),
+    Stay(usize, String),
+}
+/// Type-to-filter list navigation shared by the scheme and device pickers.
+fn list_key(key: KeyEvent, cursor: usize, mut filter: String, len: usize) -> ListKey {
+    let last = len.saturating_sub(1);
+    match key.code {
+        KeyCode::Esc => {
+            if filter.is_empty() {
+                return ListKey::Close;
+            }
+            filter.clear();
+            ListKey::Stay(0, filter)
+        }
+        KeyCode::Enter => ListKey::Pick(cursor),
+        KeyCode::Down => ListKey::Stay((cursor + 1).min(last), filter),
+        KeyCode::Up => ListKey::Stay(cursor.saturating_sub(1), filter),
+        KeyCode::PageDown => ListKey::Stay((cursor + 10).min(last), filter),
+        KeyCode::PageUp => ListKey::Stay(cursor.saturating_sub(10), filter),
+        KeyCode::Backspace => {
+            filter.pop();
+            ListKey::Stay(0, filter)
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            filter.push(c);
+            ListKey::Stay(0, filter)
+        }
+        _ => ListKey::Stay(cursor.min(last), filter),
+    }
+}
+
 pub fn run(root: &Path, initial_scheme: Option<&str>) -> Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         bail!("the TUI needs an interactive terminal; use --help for CLI commands");
     }
     let project = Project::find(root)?;
-    let mut app = App::new(project, initial_scheme);
+    let mut app = App::new(root.to_owned(), project, initial_scheme);
     let stop = Arc::new(AtomicBool::new(false));
     let signal = stop.clone();
-    ctrlc::set_handler(move || {
-        signal.store(true, Ordering::Relaxed);
-    })
-    .context("install termination handler")?;
+    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+        .context("install termination handler")?;
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
+    let mut title = String::new();
     let result = (|| -> Result<()> {
         let mut dirty = true;
+        let mut last_frame = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             dirty |= app.poll();
+            // Animate the spinner and time-based progress while something runs.
+            if app.busy() && last_frame.elapsed() >= Duration::from_millis(100) {
+                dirty = true;
+            }
             if dirty {
+                app.tick = app.tick.wrapping_add(1);
                 terminal.draw(|frame| draw(&mut app, frame))?;
+                last_frame = Instant::now();
                 dirty = false;
+                let next = window_title(&mut app);
+                if next != title {
+                    let _ = execute!(io::stdout(), SetTitle(&next));
+                    title = next;
+                }
             }
             if event::poll(Duration::from_millis(50))? {
-                match event::read()? {
-                    TerminalEvent::Key(k) => {
-                        dirty = true;
-                        if app.key(k, &mut terminal)? {
-                            break;
-                        }
-                    }
-                    TerminalEvent::Mouse(mouse) => {
-                        if matches!(
-                            mouse.kind,
-                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                        ) {
-                            app.mouse(mouse);
+                // Drain bursts (trackpad scrolling) before the next frame.
+                loop {
+                    match event::read()? {
+                        TerminalEvent::Key(k) => {
                             dirty = true;
+                            if app.key(k, &mut terminal)? {
+                                return Ok(());
+                            }
                         }
+                        TerminalEvent::Mouse(m) => {
+                            if matches!(
+                                m.kind,
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                            ) {
+                                app.mouse(m);
+                                dirty = true;
+                            }
+                        }
+                        TerminalEvent::FocusGained => app.focused = true,
+                        TerminalEvent::FocusLost => app.focused = false,
+                        TerminalEvent::Resize(_, _) => dirty = true,
+                        _ => (),
                     }
-                    TerminalEvent::Resize(_, _) => dirty = true,
-                    _ => (),
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
                 }
             }
         }
@@ -1020,38 +1259,799 @@ pub fn run(root: &Path, initial_scheme: Option<&str>) -> Result<()> {
     result
 }
 
-fn tail_offset(groups: &[Vec<String>], height: usize) -> usize {
-    if groups.is_empty() {
-        return 0;
+fn window_title(app: &mut App) -> String {
+    let name = app.project_label();
+    let name = name
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(n, _)| n)
+        .to_owned();
+    match app.live.as_mut() {
+        Some(live) if live.build_secs.is_none() => {
+            let f = live.progress.fraction(live.started.elapsed().as_secs_f64());
+            format!("{:.0}% · {name}", f * 100.0)
+        }
+        Some(live) => format!("{} · {name}", live.progress.stage.label()),
+        None => name,
     }
-    let mut used = 0;
-    let mut start = groups.len();
-    for (i, g) in groups.iter().enumerate().rev() {
-        if used > 0 && used + g.len() > height {
+}
+
+// ── drawing ──────────────────────────────────────────────────────────────────
+
+fn draw(app: &mut App, frame: &mut Frame) {
+    let area = frame.area();
+    app.popup_area = Rect::default();
+    if area.width < 40 || area.height < 10 {
+        frame.render_widget(Paragraph::new("Make the terminal at least 40 × 10"), area);
+        app.log_area = Rect::default();
+        return;
+    }
+    let x = area.x + 1;
+    let w = area.width - 2;
+    draw_header(app, frame, Rect::new(x, area.y, w, 1));
+    let status = status_lines(app, w as usize);
+    let status_h = status.len() as u16;
+    frame.render_widget(
+        Paragraph::new(status),
+        Rect::new(x, area.y + 2, w, status_h),
+    );
+    let rule_y = area.y + 2 + status_h + 1;
+    draw_rule(app, frame, Rect::new(x, rule_y, w, 1));
+    let log_y = rule_y + 1;
+    let footer_y = area.bottom() - 1;
+    app.log_area = Rect::new(x, log_y, w, footer_y.saturating_sub(log_y + 1));
+    draw_log(app, frame);
+    draw_footer(app, frame, Rect::new(x, footer_y, w, 1));
+    if let Some(popup) = app.popup.clone() {
+        draw_popup(app, frame, popup);
+    }
+}
+
+fn draw_header(app: &App, frame: &mut Frame, area: Rect) {
+    let chip = |key: &'static str, icon: &str, text: String, empty: bool| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(format!("{key} "), dim()),
+            Span::styled(
+                format!(" {icon} {text} "),
+                if empty {
+                    dim().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                },
+            ),
+            Span::raw("   "),
+        ]
+    };
+    let project = app.project_label();
+    let mut spans = vec![
+        Span::styled(
+            project
+                .rsplit_once('.')
+                .map_or(project.as_str(), |(n, _)| n)
+                .to_owned(),
+            bold(),
+        ),
+        Span::raw("   "),
+    ];
+    let (scheme, no_scheme) = match app.selected_scheme() {
+        Some(s) => (s.name.clone(), false),
+        None if !app.schemes_loaded => ("…".into(), true),
+        None => ("Scheme".into(), true),
+    };
+    spans.extend(chip("s", "◆", scheme, no_scheme));
+    let (device, icon, no_device) = match app.selected_destination() {
+        Some(d) if d.device => (d.name.clone(), "▯", false),
+        Some(d) if d.is_mac() => (d.name.clone(), "▭", false),
+        Some(d) => (
+            format!(
+                "{} {}",
+                d.name,
+                d.runtime.split_whitespace().last().unwrap_or_default()
+            ),
+            "▢",
+            false,
+        ),
+        None if !app.destinations_loaded => ("…".into(), "▯", true),
+        None => ("Device".into(), "▯", true),
+    };
+    spans.extend(chip("d", icon, device, no_device));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn bar(fraction: f64, width: usize, style: Style) -> Vec<Span<'static>> {
+    let cells = width.max(1);
+    let filled = ((fraction.clamp(0.0, 1.0)) * cells as f64).round() as usize;
+    vec![
+        Span::styled("━".repeat(filled), style),
+        Span::styled("─".repeat(cells - filled), dim()),
+    ]
+}
+/// A short segment bouncing across the bar, for work without a measurable end.
+fn sweep(tick: usize, width: usize) -> Vec<Span<'static>> {
+    let seg = (width / 6).max(3).min(width);
+    let span = width.saturating_sub(seg).max(1);
+    let pos = tick % (span * 2);
+    let at = if pos > span { span * 2 - pos } else { pos }.min(width - seg);
+    vec![
+        Span::styled("─".repeat(at), dim()),
+        Span::styled("━".repeat(seg), bold()),
+        Span::styled("─".repeat(width - seg - at), dim()),
+    ]
+}
+
+fn clock(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Left text and right text on one line, the left truncated to fit.
+fn split_line(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let right_w: usize = right.iter().map(|s| s.content.width()).sum();
+    let mut budget = width.saturating_sub(right_w + 2);
+    let mut spans = vec![];
+    for s in left {
+        if budget == 0 {
             break;
         }
-        used += g.len();
-        start = i;
-        if used >= height {
-            break;
+        let text = truncate(&s.content, budget);
+        budget -= text.width();
+        spans.push(Span::styled(text, s.style));
+    }
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used + right_w))));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+fn status_lines(app: &mut App, width: usize) -> Vec<Line<'static>> {
+    let tick = app.tick;
+    let spin = SPINNER[tick % SPINNER.len()];
+    if let Some(live) = app.live.as_mut() {
+        let elapsed = live.started.elapsed().as_secs_f64();
+        let job = &app.jobs[0];
+        let (errors, warnings) = job.phases[0].counts();
+        let p = &mut live.progress;
+        let installing = live.build_secs.is_some();
+        let attached = job.attached.is_some();
+        if attached {
+            let since = job
+                .attached
+                .map(|t| (chrono::Local::now() - t).num_seconds() as f64)
+                .unwrap_or(0.0);
+            return vec![
+                split_line(
+                    vec![
+                        Span::styled("● ", Style::default().fg(Color::Green)),
+                        Span::styled("Running ", bold()),
+                        Span::raw(format!("{} on {}", job.app, live.destination)),
+                    ],
+                    vec![Span::styled(clock(since), dim())],
+                    width,
+                ),
+                Line::from(""),
+                Line::styled(
+                    format!(
+                        "built in {}",
+                        job::short(live.build_secs.unwrap_or(job.build_elapsed))
+                    ),
+                    dim(),
+                ),
+            ];
+        }
+        let label = match (installing, p.stage) {
+            (true, Stage::Launching) => format!("Launching on {}", live.destination),
+            (true, _) => format!("Installing on {}", live.destination),
+            (false, _) if job.kind == "clean" => "Cleaning".to_owned(),
+            (false, s) => s.label().to_owned(),
+        };
+        let mut left = vec![Span::raw(format!("{spin} ")), Span::styled(label, bold())];
+        if !p.detail.is_empty() && !installing {
+            left.push(Span::raw(format!("  {}", p.detail)));
+            if !p.target.is_empty() && !p.detail.starts_with(&p.target) {
+                left.push(Span::styled(format!(" · {}", p.target), dim()));
+            }
+        }
+        let mut right = vec![Span::raw(clock(elapsed))];
+        if !installing && let Some(left) = p.remaining(elapsed) {
+            right.push(Span::styled(format!(" · ~{} left", clock(left)), dim()));
+        }
+        let pct_w = 5;
+        let bar_w = width.saturating_sub(pct_w + 1);
+        let (mut bar_spans, pct) = if installing {
+            match p.install {
+                Some(f) => (bar(f, bar_w, bold()), format!("{:>3.0}%", f * 100.0)),
+                None => (sweep(tick, bar_w), String::new()),
+            }
+        } else if job.kind == "clean" || job.kind == "resolve" {
+            (sweep(tick, bar_w), String::new())
+        } else {
+            let f = p.fraction(elapsed);
+            (bar(f, bar_w, bold()), format!("{:>3.0}%", f * 100.0))
+        };
+        bar_spans.push(Span::raw(format!(" {pct:>4}")));
+        let mut facts = vec![];
+        if p.total_targets > 0 && !installing {
+            facts.push(format!(
+                "{} of {} targets",
+                p.targets_started().min(p.total_targets),
+                p.total_targets
+            ));
+        }
+        if p.tasks > 0 && !installing {
+            facts.push(job::count(p.tasks, "task"));
+        }
+        if p.tests_passed + p.tests_failed > 0 {
+            facts.push(format!("{} passed", p.tests_passed));
+        }
+        let mut third: Vec<Span> = vec![Span::styled(facts.join(" · "), dim())];
+        let mut sep = !facts.is_empty();
+        let mut add = |text: String, style: Style| {
+            if sep {
+                third.push(Span::styled(" · ", dim()));
+            }
+            third.push(Span::styled(text, style));
+            sep = true;
+        };
+        if p.tests_failed > 0 {
+            add(
+                format!("{} failed", p.tests_failed),
+                Style::default().fg(Color::Red),
+            );
+        }
+        if errors > 0 {
+            add(job::count(errors, "error"), Style::default().fg(Color::Red));
+        }
+        if warnings > 0 {
+            add(
+                job::count(warnings, "warning"),
+                Style::default().fg(Color::Yellow),
+            );
+        }
+        return vec![
+            split_line(left, right, width),
+            Line::from(bar_spans),
+            Line::from(third),
+        ];
+    }
+    // Idle: the shown run's outcome, or a ready state.
+    let Some(job) = app.jobs.get(app.shown) else {
+        let ready = match (app.selected_scheme(), app.selected_destination()) {
+            (Some(_), Some(d)) => format!("Ready to run on {}", d.name),
+            _ if !app.schemes_loaded || !app.destinations_loaded => {
+                "Looking for schemes and devices…".into()
+            }
+            (None, _) => "Choose a scheme".into(),
+            (_, None) => "Choose a device".into(),
+        };
+        return vec![Line::styled(ready, dim()), Line::from(""), Line::from("")];
+    };
+    let (errors, warnings) = job.phases.first().map(|p| p.counts()).unwrap_or_default();
+    let (mark, color) = match job.outcome.as_str() {
+        "succeeded" | "exited" => ("✓", Color::Green),
+        "failed" => ("✗", Color::Red),
+        "stopped" => ("■", Color::Yellow),
+        _ => ("•", Color::Reset),
+    };
+    let what = match (
+        job.kind.as_str(),
+        job.outcome.as_str(),
+        job.build_outcome.as_str(),
+    ) {
+        ("run", "exited", _) => "App exited".to_owned(),
+        ("run", "stopped", "succeeded") => "App stopped".to_owned(),
+        ("run", "failed", "succeeded") => "Install or launch failed".to_owned(),
+        ("run", o, _) => format!("Build {o}"),
+        (k, o, _) => format!("{} {o}", capitalize(k)),
+    };
+    let when = job::when_at(
+        job.started.naive_local(),
+        chrono::Local::now().naive_local(),
+    );
+    let mut facts = vec![job::short(job.elapsed)];
+    if errors > 0 {
+        facts.push(job::count(errors, "error"));
+    }
+    if warnings > 0 {
+        facts.push(job::count(warnings, "warning"));
+    }
+    let mut left = vec![
+        Span::styled(format!("{mark} "), Style::default().fg(color)),
+        Span::styled(what, bold()),
+        Span::styled(format!("  {}", facts.join(" · ")), dim()),
+    ];
+    if app.shown != 0 {
+        left.push(Span::styled("  · esc latest", dim()));
+    }
+    let mut lines = vec![split_line(left, vec![Span::styled(when, dim())], width)];
+    if job.outcome == "failed" {
+        let phase = &job.phases[0];
+        let problems = if phase.is_loaded() {
+            diagnose::problems(&phase.lines, 2)
+        } else {
+            vec![]
+        };
+        for p in problems.iter().take(2) {
+            let mut spans = vec![];
+            if !p.place.is_empty() {
+                spans.push(Span::styled(format!("{}  ", p.place), bold()));
+            }
+            spans.push(Span::styled(
+                p.message.clone(),
+                Style::default().fg(Color::Red),
+            ));
+            lines.push(split_line(spans, vec![], width));
+            if let Some(hint) = p.hint {
+                lines.push(split_line(
+                    vec![Span::styled(format!("→ {hint}"), dim())],
+                    vec![],
+                    width,
+                ));
+                break;
+            }
         }
     }
-    start
+    while lines.len() < 3 {
+        lines.push(Line::from(""));
+    }
+    lines.truncate(3);
+    lines
+}
+
+fn draw_rule(app: &App, frame: &mut Frame, area: Rect) {
+    let job = app.jobs.get(app.shown);
+    let has_console = job.is_some_and(|j| j.phases.len() > 1);
+    let tab = |name: &str, on: bool| {
+        if on {
+            Span::styled(format!(" {name} "), bold().add_modifier(Modifier::REVERSED))
+        } else {
+            Span::styled(format!(" {name} "), dim())
+        }
+    };
+    let mut spans = vec![Span::styled("─", dim()), tab("Build", app.phase == 0)];
+    if has_console {
+        spans.push(tab("Console", app.phase == 1));
+    }
+    if app.problems_only && app.filter.is_empty() {
+        spans.push(Span::styled(
+            " · problems",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !app.filter.is_empty() || app.typing {
+        spans.push(Span::styled(
+            format!(" /{}{}", app.filter, if app.typing { "▏" } else { "" }),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if !app.follow {
+        spans.push(Span::styled(" · G follow", dim()));
+    }
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    spans.push(Span::styled(
+        format!(
+            " {}",
+            "─".repeat((area.width as usize).saturating_sub(used + 1))
+        ),
+        dim(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_log(app: &App, frame: &mut Frame) {
+    let area = app.log_area;
+    if area.height == 0 {
+        return;
+    }
+    let indices = app.indices();
+    let len = app.visible_len(&indices);
+    let width = area.width.max(1) as usize;
+    let height = area.height as usize;
+    if len == 0 {
+        let text = if app.jobs.is_empty() {
+            ""
+        } else if !app.filter.is_empty() {
+            "no matching lines"
+        } else if app.problems_only {
+            "no problems · i shows the full log"
+        } else if app.live.is_some() {
+            "waiting for output…"
+        } else {
+            ""
+        };
+        frame.render_widget(Paragraph::new(Line::styled(text, dim())), area);
+        return;
+    }
+    let tail = app.tail_top(&indices);
+    let top = if app.follow { tail } else { app.top.min(tail) };
+    let mut rows: Vec<Line> = Vec::with_capacity(height);
+    let mut n = top;
+    while rows.len() < height && n < len {
+        let text = app.line_at(&indices, n);
+        let style = line_style(text);
+        for part in wrap(text, width) {
+            if rows.len() == height {
+                break;
+            }
+            rows.push(Line::styled(part, style));
+        }
+        n += 1;
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn draw_footer(app: &App, frame: &mut Frame, area: Rect) {
+    let primary_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let (primary, ready) = if app.typing {
+        (" enter keep · esc clear ".to_owned(), true)
+    } else if app.live.is_some() {
+        let attached = app.jobs.first().is_some_and(|j| j.attached.is_some());
+        (
+            if attached {
+                " ■ x  Stop app ".to_owned()
+            } else {
+                " ■ x  Stop ".to_owned()
+            },
+            true,
+        )
+    } else {
+        match app.selected_destination() {
+            Some(d) if app.selected_scheme().is_some() => {
+                (format!(" ▶ r  Run on {} ", d.name), true)
+            }
+            _ => (" ▶ r  Run ".to_owned(), false),
+        }
+    };
+    let style = if ready {
+        primary_style
+    } else {
+        dim().add_modifier(Modifier::REVERSED)
+    };
+    let secondary = if app.typing {
+        ""
+    } else if app.busy() {
+        "tab console · i problems · / filter · ? keys"
+    } else {
+        "b build · t test · c clean · h history · ? keys"
+    };
+    let mut spans = vec![Span::styled(primary.clone(), style), Span::raw("   ")];
+    let mut rest = secondary.to_owned();
+    if let Some((toast, _)) = &app.toast {
+        rest = toast.clone();
+        spans.push(Span::styled(
+            truncate(
+                &rest,
+                (area.width as usize).saturating_sub(primary.width() + 3),
+            ),
+            Style::default().fg(Color::Cyan),
+        ));
+    } else {
+        spans.push(Span::styled(
+            truncate(
+                &rest,
+                (area.width as usize).saturating_sub(primary.width() + 3),
+            ),
+            dim(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn popup_rect(frame: &Frame, width: u16, height: u16) -> Rect {
+    let screen = frame.area();
+    let width = width.min(screen.width.saturating_sub(4)).max(10);
+    let height = height.min(screen.height.saturating_sub(2)).max(3);
+    Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height.saturating_sub(height)) / 3,
+        width,
+        height,
+    )
+}
+
+fn draw_list(
+    app: &mut App,
+    frame: &mut Frame,
+    title: &str,
+    filter: Option<&str>,
+    rows: Vec<(String, String, Style, bool)>,
+    cursor: usize,
+    footer: &str,
+) {
+    let screen = frame.area();
+    let visible = (screen.height.saturating_sub(8) as usize).clamp(3, 18);
+    let width = rows
+        .iter()
+        .map(|(l, r, _, _)| l.width() + r.width() + 8)
+        .max()
+        .unwrap_or(30)
+        .clamp(40, 76) as u16;
+    let extra = 2 + u16::from(filter.is_some()) + u16::from(!footer.is_empty());
+    let rect = popup_rect(frame, width, visible.min(rows.len().max(1)) as u16 + extra);
+    app.popup_area = rect;
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(dim())
+        .title(Span::styled(format!(" {title} "), bold()));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let mut lines = vec![];
+    if let Some(f) = filter {
+        lines.push(if f.is_empty() {
+            Line::styled("type to filter", dim())
+        } else {
+            Line::styled(format!("/{f}▏"), Style::default().fg(Color::Cyan))
+        });
+    }
+    let room =
+        (inner.height as usize).saturating_sub(lines.len() + usize::from(!footer.is_empty()));
+    let first = cursor.saturating_sub(room.saturating_sub(1));
+    let w = inner.width as usize;
+    if rows.is_empty() {
+        lines.push(Line::styled("nothing here", dim()));
+    }
+    for (n, (left, right, style, current)) in rows.into_iter().enumerate().skip(first).take(room) {
+        let mark = if current { "● " } else { "  " };
+        let text = truncate(
+            &format!("{mark}{left}"),
+            w.saturating_sub(right.width() + 1),
+        );
+        let pad = w.saturating_sub(text.width() + right.width());
+        let line = Line::from(vec![
+            Span::styled(text, style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(right, dim()),
+        ]);
+        lines.push(if n == cursor {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        });
+    }
+    if !footer.is_empty() {
+        while lines.len() + 1 < inner.height as usize {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::styled(footer.to_owned(), dim()));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_popup(app: &mut App, frame: &mut Frame, popup: Popup) {
+    match popup {
+        Popup::Schemes { cursor, filter } => {
+            let rows = app
+                .scheme_rows(&filter)
+                .into_iter()
+                .map(|i| {
+                    let s = &app.schemes[i];
+                    (
+                        s.name.clone(),
+                        if s.package {
+                            "package".into()
+                        } else {
+                            String::new()
+                        },
+                        Style::default(),
+                        app.scheme == Some(i),
+                    )
+                })
+                .collect();
+            draw_list(app, frame, "Scheme", Some(&filter), rows, cursor, "");
+        }
+        Popup::Devices { cursor, filter } => {
+            let rows = app
+                .device_rows(&filter)
+                .into_iter()
+                .map(|i| {
+                    let d = &app.destinations[i];
+                    let right = if d.is_mac() {
+                        String::new()
+                    } else if d.state == "Booted" {
+                        format!("{} · booted", d.runtime)
+                    } else {
+                        d.runtime.clone()
+                    };
+                    let icon = if d.device {
+                        "▯ "
+                    } else if d.is_mac() {
+                        "▭ "
+                    } else {
+                        "▢ "
+                    };
+                    (
+                        format!("{icon}{}", d.name),
+                        right,
+                        if d.device { bold() } else { Style::default() },
+                        app.destination == Some(i),
+                    )
+                })
+                .collect();
+            draw_list(
+                app,
+                frame,
+                "Run on",
+                Some(&filter),
+                rows,
+                cursor,
+                "ctrl+r rename simulator",
+            );
+        }
+        Popup::History { cursor } => {
+            let rows = app
+                .jobs
+                .iter()
+                .enumerate()
+                .map(|(n, j)| {
+                    let (e, w) = j.phases.first().map(|p| p.counts()).unwrap_or_default();
+                    let mut facts = vec![];
+                    if j.outcome != "running" {
+                        facts.push(job::short(j.elapsed));
+                    }
+                    if e > 0 {
+                        facts.push(job::count(e, "error"));
+                    }
+                    if w > 0 {
+                        facts.push(job::count(w, "warning"));
+                    }
+                    let when =
+                        job::when_at(j.started.naive_local(), chrono::Local::now().naive_local());
+                    (
+                        format!(
+                            "{} {:<6} {}",
+                            job::mark(&j.outcome, j.attached.is_some()),
+                            j.kind,
+                            when
+                        ),
+                        facts.join(" · "),
+                        match j.outcome.as_str() {
+                            "failed" => Style::default().fg(Color::Red),
+                            "succeeded" | "exited" => Style::default().fg(Color::Green),
+                            "stopped" => Style::default().fg(Color::Yellow),
+                            _ => Style::default(),
+                        },
+                        n == app.shown,
+                    )
+                })
+                .collect();
+            draw_list(
+                app,
+                frame,
+                "History",
+                None,
+                rows,
+                cursor,
+                "enter open · D delete all",
+            );
+        }
+        Popup::Rename { text, .. } => {
+            let rect = popup_rect(frame, 50, 4);
+            app.popup_area = rect;
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("{text}▏")),
+                    Line::styled("enter rename · esc cancel", dim()),
+                ])
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(dim())
+                        .title(Span::styled(" Rename simulator ", bold())),
+                ),
+                rect,
+            );
+        }
+        Popup::ConfirmDelete => {
+            let n = app.jobs.len() - usize::from(app.busy());
+            let rect = popup_rect(frame, 40, 4);
+            app.popup_area = rect;
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(format!("Delete {}?", job::count(n, "run"))),
+                    Line::styled("y delete · any other key keeps them", dim()),
+                ])
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(dim()),
+                ),
+                rect,
+            );
+        }
+        Popup::Help => {
+            let mut lines: Vec<Line> = HELP
+                .iter()
+                .map(|(k, d)| {
+                    Line::from(vec![
+                        Span::styled(format!("{k:<16}"), bold()),
+                        Span::raw(*d),
+                    ])
+                })
+                .collect();
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "{} parallel compile jobs · XCTUIRS_JOBS changes it",
+                    runtime::parallel_jobs().map_or("xcodebuild's".into(), |n| n.to_string())
+                ),
+                dim(),
+            ));
+            let rect = popup_rect(frame, 62, lines.len() as u16 + 2);
+            app.popup_area = rect;
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(dim())
+                        .title(Span::styled(" Keys ", bold())),
+                ),
+                rect,
+            );
+        }
+    }
+}
+
+// ── text helpers ─────────────────────────────────────────────────────────────
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
 }
 fn contains(text: &str, filter: &str) -> bool {
-    text.to_lowercase().contains(&filter.to_lowercase())
+    filter.is_empty() || text.to_lowercase().contains(&filter.to_lowercase())
 }
-fn strip_time(text: &str) -> &str {
-    let bytes = text.as_bytes();
-    if bytes.len() > 13
-        && bytes.get(2) == Some(&b':')
-        && bytes.get(5) == Some(&b':')
-        && bytes.get(8) == Some(&b'.')
-        && let Some(i) = text.find(' ')
-    {
-        return &text[i + 1..];
+fn contains_point(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+}
+/// The last carriage-return segment, as a terminal would show it.
+fn clean(line: &str) -> &str {
+    line.trim_end_matches('\r')
+        .rsplit('\r')
+        .next()
+        .unwrap_or("")
+}
+fn line_style(text: &str) -> Style {
+    match job::kind(text) {
+        "error" => Style::default().fg(Color::Red),
+        "warning" => Style::default().fg(Color::Yellow),
+        _ if text.starts_with("▸ ") || text.starts_with("** ") => bold(),
+        _ => Style::default(),
     }
-    text
+}
+fn truncate(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
+}
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let w: usize = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| c.width().unwrap_or(0))
+        .sum();
+    w.div_ceil(width.max(1)).max(1)
 }
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
@@ -1072,1209 +2072,281 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     }
     lines
 }
-fn style_for(text: &str) -> Style {
-    if text.contains("error: ") {
-        Style::default().fg(Color::Red)
-    } else if text.contains("warning: ") {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    }
-}
-fn outcome_style(outcome: &str) -> Style {
-    Style::default().fg(match outcome {
-        "failed" => Color::Red,
-        "succeeded" | "exited" => Color::Green,
-        "stopped" => Color::Yellow,
-        _ => Color::Reset,
-    })
-}
-fn border(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
-}
-fn frame_block(number: usize, title: &str, focused: bool, bottom: &str) -> Block<'static> {
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Plain)
-        .border_style(border(focused))
-        .title(format!("[{number}]─{title}"));
-    if !bottom.is_empty() {
-        block = block.title_bottom(bottom.to_owned());
-    }
-    block
-}
-fn filter_label(filter: &str, typing: bool) -> String {
-    if filter.is_empty() && !typing {
-        String::new()
-    } else {
-        format!("/{filter}{}", if typing { "▏" } else { "" })
-    }
-}
-fn tabs(names: &[&str], active: usize, width: u16) -> String {
-    let budget = width.saturating_sub(6) as usize;
-    let full = names.join(" · ");
-    if unicode_width::UnicodeWidthStr::width(full.as_str()) <= budget {
-        full
-    } else {
-        let tight = names.join("·");
-        if unicode_width::UnicodeWidthStr::width(tight.as_str()) <= budget {
-            tight
-        } else {
-            names[active].to_owned()
-        }
-    }
-}
-fn list(
-    frame: &mut Frame,
-    area: Rect,
-    block: Block<'_>,
-    items: Vec<(String, Style)>,
-    cursor: usize,
-    focused: bool,
-) {
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let first = cursor.saturating_sub(inner.height.saturating_sub(1) as usize);
-    for (row, (text, style)) in items
-        .into_iter()
-        .enumerate()
-        .skip(first)
-        .take(inner.height as usize)
-    {
-        let style = if focused && row == cursor {
-            style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            style
-        };
-        let rowarea = Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1);
-        // A styled Paragraph fills the entire cursor row, including trailing spaces.
-        frame.render_widget(Paragraph::new(text).style(style), rowarea);
-    }
-}
-fn draw(app: &mut App, frame: &mut Frame) {
-    let area = frame.area();
-    app.pane_areas = [Rect::default(); 5];
-    if area.width < 40 || area.height < 8 {
-        frame.render_widget(Paragraph::new("Enlarge terminal to at least 40 × 8"), area);
-        return;
-    }
-    let body = area.height.saturating_sub(1);
-    let left = (area.width / 3).max(32).min(area.width);
-    let right = Rect::new(area.x + left, area.y, area.width - left, body);
-    app.pane_areas[0] = right;
-    app.detail_width = right.width.saturating_sub(2) as usize;
-    app.detail_height = right.height.saturating_sub(2) as usize;
-    let rest = body.saturating_sub(4);
-    let third = rest / 3;
-    let panes = [
-        Rect::new(area.x, area.y, left, 4),
-        Rect::new(area.x, area.y + 4, left, third),
-        Rect::new(area.x, area.y + 4 + third, left, third),
-        Rect::new(area.x, area.y + 4 + 2 * third, left, rest - 2 * third),
-    ];
-    for n in 1..=4 {
-        if app.expanded && app.last_left != n {
-            continue;
-        }
-        let rect = if app.expanded {
-            Rect::new(area.x, area.y, left, body)
-        } else {
-            panes[n - 1]
-        };
-        app.pane_areas[n] = rect;
-        draw_left(app, frame, n, rect);
-    }
-    let selected = app.selected();
-    let filter = app.phase_filter();
-    let mut title = selected
-        .map(|(j, p)| {
-            format!(
-                "Detail: {}",
-                if p == 0 {
-                    app.jobs[j].build_summary()
-                } else {
-                    app.jobs[j].console_summary()
-                }
-            )
-        })
-        .unwrap_or_else(|| "Detail".into());
-    if app.issues && filter.is_empty() {
-        title.push_str(" · issues only");
-    }
-    let groups = app.line_groups();
-    let tail = tail_offset(&groups, app.detail_height);
-    let view = selected
-        .and_then(|k| app.views.get(&k))
-        .copied()
-        .unwrap_or(View {
-            offset: tail,
-            follow: true,
-        });
-    if !view.follow {
-        title.push_str(" · G follows");
-    }
-    let block = frame_block(
-        0,
-        &title,
-        app.focus == 0,
-        &filter_label(&filter, app.typing && app.focus == 0),
-    );
-    let inner = block.inner(right);
-    frame.render_widget(block, right);
-    let offset = if view.follow {
-        tail
-    } else {
-        view.offset.min(tail)
-    };
-    let visible: Vec<Line> = if groups.is_empty() {
-        let hint = if app.jobs.is_empty() {
-            if app.destination.is_some_and(|i| app.destinations[i].device) {
-                "b build · r run on the device · t test · c clean"
-            } else {
-                "b build · r run on the simulator · t test · c clean"
-            }
-        } else if !filter.is_empty() {
-            "no line matches"
-        } else if app.issues {
-            "No errors or warnings. i shows the full log."
-        } else {
-            "waiting for output"
-        };
-        vec![Line::styled(hint, Style::default().fg(Color::DarkGray))]
-    } else {
-        groups
-            .into_iter()
-            .skip(offset)
-            .flatten()
-            .take(app.detail_height)
-            .map(|s| {
-                let st = style_for(&s);
-                Line::styled(s, st)
-            })
-            .collect()
-    };
-    frame.render_widget(Paragraph::new(visible), inner);
-    let footer = if app.typing {
-        "type to filter  enter keep  esc clear"
-    } else {
-        "b build  r run  t test  c clean  p resolve packages  x stop  0-4/tab focus  e editor  ? help  q quit"
-    };
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        Rect::new(area.x, area.y + body, area.width, 1),
-    );
-    if let Some(popup) = app.popup.clone() {
-        draw_popup(app, frame, popup);
-    }
-}
-fn draw_left(app: &App, frame: &mut Frame, n: usize, area: Rect) {
-    let focused = app.focus == n;
-    match n {
-        1 => {
-            let summary = if !app.message.is_empty() {
-                app.message.clone()
-            } else if app.session_job {
-                app.jobs.first().map(Job::summary).unwrap_or_default()
-            } else if let Some(job) = app.jobs.first() {
-                format!("last time: {}", job.summary())
-            } else {
-                "no runs yet · b builds".into()
-            };
-            let style = if app.message.is_empty() && app.session_job {
-                app.jobs
-                    .first()
-                    .map(|j| outcome_style(&j.outcome))
-                    .unwrap_or_default()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let block = frame_block(1, "Status", focused, "");
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled(summary, style),
-                    Line::styled(
-                        app.project
-                            .name
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
-                inner,
-            );
-        }
-        2 => {
-            let items = app
-                .scheme_indices()
-                .iter()
-                .map(|&i| {
-                    (
-                        format!(
-                            "{}{}",
-                            if app.scheme == Some(i) { "* " } else { "  " },
-                            app.schemes[i].name
-                        ),
-                        Style::default(),
-                    )
-                })
-                .collect();
-            let title = tabs(&["Schemes", "Packages"], app.scheme_tab, area.width);
-            let block = frame_block(
-                2,
-                &title,
-                focused,
-                &filter_label(&app.scheme_filter, app.typing && focused),
-            );
-            list(frame, area, block, items, app.scheme_cursor, focused);
-        }
-        3 => {
-            let items = app
-                .destination_indices()
-                .iter()
-                .map(|&i| {
-                    let d = &app.destinations[i];
-                    let label = if app.destination_tab == 0 {
-                        d.label()
-                    } else {
-                        let runtime = d
-                            .runtime
-                            .strip_prefix(&format!("{} ", d.platform()))
-                            .unwrap_or(&d.runtime);
-                        format!(
-                            "{} {}{}",
-                            d.name,
-                            runtime,
-                            if d.state == "Booted" { " ●" } else { "" }
-                        )
-                    };
-                    (
-                        format!(
-                            "{}{label}",
-                            if app.destination == Some(i) {
-                                "* "
-                            } else {
-                                "  "
-                            }
-                        ),
-                        if d.device {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default()
-                        },
-                    )
-                })
-                .collect();
-            let title = tabs(PLATFORMS, app.destination_tab, area.width);
-            let block = frame_block(
-                3,
-                &title,
-                focused,
-                &filter_label(&app.destination_filter, app.typing && focused),
-            );
-            list(frame, area, block, items, app.destination_cursor, focused);
-        }
-        4 => {
-            let items = app
-                .rows()
-                .iter()
-                .enumerate()
-                .map(|(row, &(j, p))| {
-                    (
-                        format!(
-                            "{}{}",
-                            if row == app.run_cursor { "* " } else { "  " },
-                            app.jobs[j].row(p == 1)
-                        ),
-                        outcome_style(if p == 0 && app.jobs[j].kind == "run" {
-                            &app.jobs[j].build_outcome
-                        } else {
-                            &app.jobs[j].outcome
-                        }),
-                    )
-                })
-                .collect();
-            list(
-                frame,
-                area,
-                frame_block(4, "Runs", focused, ""),
-                items,
-                app.run_cursor,
-                focused,
-            );
-        }
-        _ => (),
-    }
-}
-fn draw_popup(app: &App, frame: &mut Frame, popup: Popup) {
-    let (title, width, lines) = match popup {
-        Popup::Help => {
-            let mut lines: Vec<Line> = HELP
-                .iter()
-                .map(|(k, d)| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{k:<16} "),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(*d),
-                    ])
-                })
-                .collect();
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                "any key closes",
-                Style::default().fg(Color::DarkGray),
-            ));
-            ("Keys", 64, lines)
-        }
-        Popup::Delete => {
-            let count = app.jobs.len() - usize::from(app.busy());
-            (
-                "Delete history",
-                40,
-                vec![
-                    Line::from(format!(
-                        "Delete {count} run{} from the history?",
-                        if count == 1 { "" } else { "s" }
-                    )),
-                    Line::from(""),
-                    Line::from("y yes  n no"),
-                ],
-            )
-        }
-        Popup::Rename { text, .. } => (
-            "Rename simulator",
-            64,
-            vec![
-                Line::from(format!("{text}▏")),
-                Line::from(""),
-                Line::from("enter rename  esc cancel"),
-            ],
-        ),
-    };
-    let screen = frame.area();
-    let width = width.min(screen.width);
-    let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(1));
-    let rect = Rect::new(
-        (screen.width - width) / 2,
-        (screen.height.saturating_sub(1) - height) / 2,
-        width,
-        height,
-    );
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title).border_style(border(true))),
-        rect,
-    );
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn wrapping_preserves_spaces_and_cells() {
-        assert_eq!(wrap("abc def", 4), vec!["abc ", "def"]);
-        assert_eq!(wrap("a界b", 2), vec!["a", "界", "b"]);
-        assert_eq!(wrap("", 5), vec![""]);
-    }
-    #[test]
-    fn timestamps_are_optional() {
-        assert_eq!(strip_time("12:34:56.789 hello"), "hello");
-        assert_eq!(strip_time("hello"), "hello");
-    }
-    #[test]
-    fn filtering_ignores_case() {
-        assert!(contains("My iPhone", "IPHONE"));
-    }
-    #[test]
-    fn tab_bar_falls_back() {
-        assert_eq!(tabs(&["Schemes", "Packages"], 1, 12), "Packages");
-    }
-}
-
-#[cfg(test)]
-mod spec_tests {
-    use super::*;
-    use serde_yaml::Value;
-    pub(super) fn fixture() -> App {
-        let yaml: Value = serde_yaml::from_str(include_str!("../spec/tests.yaml")).unwrap();
-        let f = &yaml["tui"]["fixture"];
-        let project = Project {
-            name: f["container"].as_str().unwrap().into(),
-            root: "/src".into(),
-        };
-        let schemes = f["schemes"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .map(|v| Scheme {
-                name: v["name"].as_str().unwrap().into(),
-                package: v["package"].as_bool().unwrap_or(false),
-            })
-            .collect::<Vec<_>>();
-        let destinations = f["destinations"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .map(|v| Destination {
-                name: v["name"].as_str().unwrap().into(),
-                runtime: v["runtime"].as_str().unwrap().into(),
-                state: v["state"].as_str().unwrap().into(),
-                udid: v["udid"].as_str().unwrap().into(),
-                device: false,
-            })
-            .collect::<Vec<_>>();
-        let (tx, rx) = mpsc::channel();
-        App {
-            scheme: xcode::default_scheme(&project, &schemes),
-            destination: xcode::default_destination(&destinations),
-            project,
-            schemes,
-            destinations,
-            scheme_cursor: 1,
-            destination_cursor: 0,
-            scheme_tab: 0,
-            destination_tab: 0,
-            scheme_filter: String::new(),
-            destination_filter: String::new(),
-            focus: 2,
-            last_left: 2,
-            expanded: false,
-            typing: false,
-            issues: false,
-            timestamps: false,
-            popup: None,
-            message: String::new(),
-            jobs: vec![],
-            run_cursor: 0,
-            active: None,
-            filters: HashMap::new(),
-            views: HashMap::new(),
-            initial_scheme: String::new(),
-            initial_destination: String::new(),
-            session_job: false,
-            discover_tx: tx,
-            discover_rx: rx,
-            background: vec![],
-            detail_width: 46,
-            detail_height: 21,
-            pane_areas: [Rect::default(); 5],
-            test_mode: true,
-            stop_requested: false,
-            #[cfg(test)]
-            pending_rename: None,
-        }
-    }
-    fn key(s: &str) -> KeyEvent {
-        let code = match s {
-            "enter" => KeyCode::Enter,
-            "space" => KeyCode::Char(' '),
-            "esc" => KeyCode::Esc,
-            "backspace" => KeyCode::Backspace,
-            "tab" => KeyCode::Tab,
-            "shift+tab" => KeyCode::BackTab,
-            "up" => KeyCode::Up,
-            "down" => KeyCode::Down,
-            "pgup" => KeyCode::PageUp,
-            "pgdown" => KeyCode::PageDown,
-            "home" => KeyCode::Home,
-            "end" => KeyCode::End,
-            "f1" => KeyCode::F(1),
-            "ctrl+u" => KeyCode::Char('u'),
-            "ctrl+d" => KeyCode::Char('d'),
-            _ => KeyCode::Char(s.chars().next().unwrap()),
-        };
-        KeyEvent::new(
-            code,
-            if s.starts_with("ctrl+") {
-                KeyModifiers::CONTROL
-            } else {
-                KeyModifiers::NONE
-            },
-        )
-    }
-    pub(super) fn press(app: &mut App, s: &str) {
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        app.key(key(s), &mut terminal).unwrap();
-    }
-    pub(super) fn keys(app: &mut App, v: &Value) {
-        for k in v.as_sequence().unwrap() {
-            press(app, k.as_str().unwrap());
-        }
-    }
-    pub(super) fn done(app: &mut App, value: &str) {
-        let stopped = app.stop_requested;
-        let job = &mut app.jobs[0];
-        if job.kind == "run" && value == "ok" && !stopped {
-            job.build_finished();
-        } else {
-            if value != "ok" && !stopped {
-                job.line(format!("error: {value}"));
-            }
-            job.finish(if value == "ok" { 0 } else { 65 }, stopped);
-        }
-    }
-    #[test]
-    fn upstream_keys_and_job_results() {
-        let yaml: Value = serde_yaml::from_str(include_str!("../spec/tests.yaml")).unwrap();
-        let tui = &yaml["tui"];
-        let mut count = 0;
-        for case in tui["keys"].as_sequence().unwrap() {
-            let mut app = fixture();
-            keys(&mut app, &case["keys"]);
-            for (key, want) in case.as_mapping().unwrap() {
-                let k = key.as_str().unwrap();
-                let actual = match k {
-                    "keys" => continue,
-                    "focus" => Value::String(
-                        ["detail", "status", "schemes", "destinations", "runs"][app.focus].into(),
-                    ),
-                    "scheme" => Value::String(app.schemes[app.scheme.unwrap()].name.clone()),
-                    "destination" => {
-                        Value::String(app.destinations[app.destination.unwrap()].name.clone())
-                    }
-                    "jobs" => serde_yaml::to_value(app.jobs.len()).unwrap(),
-                    "status" => Value::String(app.message.clone()),
-                    "typing" => Value::Bool(app.typing),
-                    "schemes_filter" => Value::String(app.scheme_filter.clone()),
-                    "destinations_filter" => Value::String(app.destination_filter.clone()),
-                    "shown_schemes" => serde_yaml::to_value(
-                        app.scheme_indices()
-                            .iter()
-                            .map(|&i| &app.schemes[i].name)
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap(),
-                    "shown_destinations" => serde_yaml::to_value(
-                        app.destination_indices()
-                            .iter()
-                            .map(|&i| &app.destinations[i].name)
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap(),
-                    "schemes_tab" => Value::String(["Schemes", "Packages"][app.scheme_tab].into()),
-                    "destinations_tab" => Value::String(PLATFORMS[app.destination_tab].into()),
-                    "expanded" => Value::Bool(app.expanded),
-                    "help" => Value::Bool(matches!(app.popup, Some(Popup::Help))),
-                    "job_outcome_after_done" => {
-                        done(&mut app, "ok");
-                        Value::String(app.jobs[0].outcome.clone())
-                    }
-                    "state_after_done" => {
-                        Value::String(if app.busy() { "building" } else { "idle" }.into())
-                    }
-                    _ => panic!("unhandled key expectation {k}"),
-                };
-                assert_eq!(&actual, want, "keys case {count}, field {k}: {case:?}");
-            }
-            count += 1;
-        }
-        for case in tui["job_results"].as_sequence().unwrap() {
-            let mut app = fixture();
-            keys(&mut app, &case["keys"]);
-            done(&mut app, case["done"].as_str().unwrap());
-            let j = &app.jobs[0];
-            assert_eq!(j.kind, case["kind"].as_str().unwrap());
-            assert_eq!(j.outcome, case["outcome"].as_str().unwrap());
-            let state = if app.busy() {
-                j.status.as_str()
-            } else {
-                "idle"
-            };
-            assert_eq!(state, case["state"].as_str().unwrap());
-            if let Some(s) = case["build_outcome"].as_str() {
-                assert_eq!(j.build_outcome, s);
-            }
-            count += 1;
-        }
-        assert_eq!(count, 40);
-        eprintln!("upstream TUI spec: {count} keys/job-results cases passed");
-    }
-    #[test]
-    fn upstream_detail_filter_and_history() {
-        let yaml: Value = serde_yaml::from_str(include_str!("../spec/tests.yaml")).unwrap();
-        let tui = &yaml["tui"];
-        let case = &tui["detail_filter"];
-        let mut app = fixture();
-        for step in case["steps"].as_sequence().unwrap() {
-            if let Some(k) = step["key"].as_str() {
-                press(&mut app, k);
-            }
-            if let Some(lines) = step["lines"].as_sequence() {
-                for l in lines {
-                    app.jobs[0].line(l.as_str().unwrap().into());
-                }
-            }
-        }
-        assert_eq!(
-            app.raw_lines(),
-            case["shown"]
-                .as_sequence()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect::<Vec<_>>()
-        );
-        for l in case["then_lines"].as_sequence().unwrap() {
-            app.jobs[0].line(l.as_str().unwrap().into());
-        }
-        assert_eq!(
-            app.raw_lines(),
-            case["shown_after"]
-                .as_sequence()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect::<Vec<_>>()
-        );
-        press(&mut app, "esc");
-        assert_eq!(app.raw_lines().len(), 5);
-        let mut app = fixture();
-        press(&mut app, "b");
-        app.jobs[0].line("first build".into());
-        done(&mut app, "ok");
-        press(&mut app, "t");
-        app.jobs[0].line("the test".into());
-        assert_eq!(app.raw_lines(), ["the test"]);
-        press(&mut app, "4");
-        press(&mut app, "j");
-        assert_eq!(app.raw_lines(), ["first build"]);
-        for _ in 0..55 {
-            done(&mut app, "ok");
-            press(&mut app, "b");
-        }
-        assert_eq!(app.jobs.len(), 50);
-        eprintln!("upstream TUI spec: detail_filter + history_in_memory passed (2 cases)");
-    }
-}
-
-#[cfg(test)]
-mod more_spec_tests {
-    use super::spec_tests::{fixture, keys, press};
-    use super::*;
-    use serde_yaml::Value;
-    fn spec() -> Value {
-        serde_yaml::from_str(include_str!("../spec/tests.yaml")).unwrap()
-    }
-    #[test]
-    fn upstream_after_loading() {
-        let app = fixture();
-        let yaml = spec();
-        let want = &yaml["tui"]["after_loading"];
-        assert_eq!(
-            app.schemes[app.scheme.unwrap()].name,
-            want["scheme"].as_str().unwrap()
-        );
-        assert_eq!(
-            app.scheme_cursor,
-            want["scheme_cursor"].as_u64().unwrap() as usize
-        );
-        assert_eq!(
-            app.destinations[app.destination.unwrap()].name,
-            want["destination"].as_str().unwrap()
-        );
-        assert_eq!(
-            app.destination_cursor,
-            want["destination_cursor"].as_u64().unwrap() as usize
-        );
-        assert_eq!(
-            ["detail", "status", "schemes", "destinations", "runs"][app.focus],
-            want["focus"].as_str().unwrap()
-        );
-        eprintln!("upstream TUI after_loading: 1 case passed");
-    }
-    #[test]
-    fn upstream_rename() {
-        let yaml = spec();
-        let cases = yaml["tui"]["rename"].as_sequence().unwrap();
-        for (i, case) in cases.iter().enumerate() {
-            let mut app = fixture();
-            keys(&mut app, &case["keys"]);
-            if let Some(open) = case["rename_open"].as_bool() {
-                assert_eq!(
-                    matches!(app.popup, Some(Popup::Rename { .. })),
-                    open,
-                    "rename case {i}"
-                );
-            }
-            if let Some(text) = case["rename_text"].as_str() {
-                match &app.popup {
-                    Some(Popup::Rename { text: t, .. }) => assert_eq!(t, text),
-                    _ => panic!("rename popup missing"),
-                }
-            }
-            if let Some(n) = case["jobs"].as_u64() {
-                assert_eq!(app.jobs.len(), n as usize);
-            }
-            if let Some(s) = case["focus"].as_str() {
-                assert_eq!(
-                    ["detail", "status", "schemes", "destinations", "runs"][app.focus],
-                    s
-                );
-            }
-            if case["rename"].as_str() == Some("none") {
-                assert!(app.pending_rename.is_none());
-            }
-            if let Some(argv) = case["rename"].as_sequence() {
-                let pending = app.pending_rename.take().expect("rename not started");
-                assert_eq!(
-                    pending.2,
-                    argv.iter().map(|s| s.as_str().unwrap()).collect::<Vec<_>>()
-                );
-                let result = if case["renamed"].as_str() == Some("ok") {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!(
-                        case["renamed"].as_str().unwrap().to_owned()
-                    ))
-                };
-                app.discover_tx
-                    .send(Discovery::Renamed {
-                        index: pending.0,
-                        name: pending.1,
-                        result,
-                    })
-                    .unwrap();
-                app.poll();
-            }
-            if let Some(s) = case["status"].as_str() {
-                assert_eq!(app.message, s);
-            }
-            if let Some(d) = case["destination"].as_str() {
-                assert_eq!(app.destinations[app.destination.unwrap()].name, d);
-            }
-            if let Some(shown) = case["shown_destinations"].as_sequence() {
-                assert_eq!(
-                    app.destination_indices()
-                        .iter()
-                        .map(|&i| app.destinations[i].name.as_str())
-                        .collect::<Vec<_>>(),
-                    shown
-                        .iter()
-                        .map(|s| s.as_str().unwrap())
-                        .collect::<Vec<_>>()
-                );
-            }
-            if let Some(text) = case["screen_contains"].as_str() {
-                assert!(screen(&mut app, 80, 24).contains(text));
-            }
-        }
-        assert_eq!(cases.len(), 7);
-        eprintln!("upstream TUI rename: 7 cases passed");
-    }
-    #[test]
-    fn upstream_history_delete_model() {
-        let yaml = spec();
-        let case = &yaml["persistence"]["history_delete"];
-        let mut app = fixture();
-        let mut size = (80, 24);
-        steps(&mut app, &case["steps"], &mut size);
-        assert!(screen(&mut app, 80, 24).contains(case["screen_contains"].as_str().unwrap()));
-        keys(&mut app, &case["then_keys"]);
-        assert_eq!(
-            app.jobs.len(),
-            case["jobs_after"].as_u64().unwrap() as usize
-        );
-        assert!(!app.busy());
-        keys(&mut app, &case["then_keys_2"]);
-        assert_eq!(app.message, case["status_final"].as_str().unwrap());
-        assert_eq!(
-            app.jobs.len(),
-            case["jobs_final"].as_u64().unwrap() as usize
-        );
-        assert_eq!(
-            ["detail", "status", "schemes", "destinations", "runs"][app.focus],
-            case["focus_final"].as_str().unwrap()
-        );
-        // This exercises the deletion dialog/model; store's filesystem deletion is tested separately.
-        assert_eq!(case["state_after"].as_str(), Some("idle"));
-        eprintln!(
-            "upstream persistence.history_delete: dialog/model expectations passed; filesystem covered by store tests"
-        );
-    }
-    fn visible(app: &App) -> Vec<String> {
-        let groups = app.line_groups();
-        let tail = tail_offset(&groups, app.detail_height);
-        let v = app
-            .selected()
-            .and_then(|k| app.views.get(&k))
-            .copied()
-            .unwrap_or(View {
-                offset: tail,
-                follow: true,
-            });
-        let offset = if v.follow { tail } else { v.offset.min(tail) };
-        let mut used = 0;
-        app.raw_lines()
-            .into_iter()
-            .enumerate()
-            .skip(offset)
-            .take_while(|(i, _)| {
-                if used > 0 && used + groups[*i].len() > app.detail_height {
-                    return false;
-                }
-                used += groups[*i].len();
-                true
-            })
-            .map(|(_, s)| s)
-            .collect()
-    }
-    #[test]
-    fn upstream_logview_and_half_page() {
-        let yaml = spec();
-        let cases = yaml["tui"]["logview"].as_sequence().unwrap();
-        for (i, case) in cases.iter().enumerate() {
-            let mut app = fixture();
-            press(&mut app, "b");
-            app.detail_height = 3;
-            app.detail_width = case["width"].as_u64().unwrap_or(80) as usize;
-            for step in case["steps"].as_sequence().unwrap() {
-                if let Some(lines) = step["append"].as_sequence() {
-                    for l in lines {
-                        app.jobs[0].line(l.as_str().unwrap().into());
-                    }
-                } else if let Some(n) = step["scroll"].as_i64() {
-                    app.scroll(n as isize, None);
-                } else if let Some(n) = step["scroll_to"].as_u64() {
-                    let key = app.selected().unwrap();
-                    let tail = tail_offset(&app.line_groups(), app.detail_height);
-                    app.views.insert(
-                        key,
-                        View {
-                            offset: (n as usize).min(tail),
-                            follow: n as usize >= tail,
-                        },
-                    );
-                }
-            }
-            assert_eq!(
-                visible(&app),
-                case["visible"]
-                    .as_sequence()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                "logview case {i}"
-            );
-            assert_eq!(
-                app.selected()
-                    .and_then(|k| app.views.get(&k))
-                    .map(|v| v.follow)
-                    .unwrap_or(true),
-                case["follow"].as_bool().unwrap()
-            );
-        }
-        let case = &yaml["tui"]["half_page"];
-        let mut app = fixture();
-        for step in case["steps"].as_sequence().unwrap() {
-            if let Some(k) = step["key"].as_str() {
-                press(&mut app, k);
-            } else if step["lines"].as_str().is_some() {
-                for n in 1..=100 {
-                    app.jobs[0].line(n.to_string());
-                }
-            }
-        }
-        let tail = tail_offset(&app.line_groups(), app.detail_height);
-        let view = app.views[&app.selected().unwrap()];
-        assert_eq!(view.offset, tail - app.detail_height / 2);
-        assert!(!view.follow);
-        press(&mut app, case["then"]["key"].as_str().unwrap());
-        assert_eq!(
-            app.views[&app.selected().unwrap()].follow,
-            case["follow"].as_bool().unwrap()
-        );
-        eprintln!("upstream TUI logview: 5 cases and half_page: 1 case passed");
-    }
-    fn screen(app: &mut App, w: u16, h: u16) -> String {
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| draw(app, f)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let mut rows = vec![];
-        for y in 0..h {
-            let mut row = String::new();
-            for x in 0..w {
-                row.push_str(buffer[(x, y)].symbol());
-            }
-            if y == h - 1 {
-                row = row.trim_end().to_owned();
-            }
-            rows.push(row);
-        }
-        rows.join("\n")
-    }
-    fn steps(app: &mut App, v: &Value, size: &mut (u16, u16)) {
-        if let Some(sequence) = v.as_sequence() {
-            for item in sequence {
-                steps(app, item, size);
-            }
-            return;
-        }
-        if v.as_str() == Some("log_done") {
-            return;
-        }
-        if v.as_str() == Some("app_done") {
-            app.jobs[0].finish(0, false);
-            app.jobs[0].elapsed = 2.;
-            return;
-        }
-        if let Some(dim) = v["resize"].as_sequence() {
-            *size = (
-                dim[0].as_u64().unwrap() as u16,
-                dim[1].as_u64().unwrap() as u16,
-            );
-            let _ = screen(app, size.0, size.1);
-        }
-        if let Some(k) = v["key"].as_str() {
-            press(app, k);
-            if matches!(k, "b" | "r" | "t" | "c" | "p")
-                && app.jobs.first().is_some_and(|j| j.outcome == "running")
-            {
-                use chrono::TimeZone;
-                app.jobs[0].started = chrono::Local
-                    .with_ymd_and_hms(2026, 9, 26, 10, 0, 0)
-                    .single()
-                    .unwrap();
-            }
-        }
-        if let Some(lines) = v["lines"].as_sequence() {
-            for l in lines {
-                app.jobs[0].line(crate::job::strip_paths(
-                    l.as_str().unwrap(),
-                    &app.project.name,
-                ));
-            }
-        }
-        if let Some(result) = v["done"].as_str() {
-            super::spec_tests::done(app, result);
-            let j = &mut app.jobs[0];
-            j.elapsed = 2.;
-            j.build_elapsed = 2.;
-            if j.kind == "run" && result == "ok" && !app.stop_requested {
-                j.line(format!(
-                    "▸ Installing and launching on {}",
-                    app.destinations[app.destination.unwrap()].name
-                ));
-            }
-        }
-        if let Some(app_id) = v["launched"]["app"].as_str() {
-            app.jobs[0].line(format!(
-                "▸ Launched {app_id}. Its output is in the console row above."
-            ));
-            app.jobs[0].attach(app_id.into());
-            app.jobs[0].build_elapsed = 2.;
-            app.run_cursor = 0;
-        }
-        if let Some(lines) = v["app_lines"].as_sequence() {
-            for l in lines {
-                let s = l.as_str().unwrap();
-                let mirrored = runtime::console_line(s);
-                let line = if mirrored.ends_with(s) {
-                    format!("10:00:02.500 {s}")
-                } else {
-                    mirrored
-                };
-                app.jobs[0].line(line);
-            }
-        }
-        if let Some(lines) = v["log_lines"].as_sequence() {
-            for l in lines {
-                if let Some(line) = runtime::clean_log_line(l.as_str().unwrap()) {
-                    app.jobs[0].line(line);
-                }
-            }
-        }
-    }
-    #[test]
-    fn upstream_screens() {
-        let yaml = spec();
-        let cases = yaml["tui"]["screens"].as_sequence().unwrap();
-        let mut mismatches = vec![];
-        for case in cases {
-            let mut app = fixture();
-            let mut size = (80, 24);
-            steps(&mut app, &case["steps"], &mut size);
-            let got = screen(&mut app, size.0, size.1);
-            let file = case["screen"].as_str().unwrap();
-            let want = std::fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("spec")
-                    .join(file),
-            )
-            .unwrap();
-            if got != want {
-                let first = got
-                    .lines()
-                    .zip(want.lines())
-                    .position(|(g, w)| g != w)
-                    .unwrap_or(0);
-                eprintln!(
-                    "screen {} differs at line {}:\n got {:?}\nwant {:?}",
-                    case["name"].as_str().unwrap(),
-                    first + 1,
-                    got.lines().nth(first),
-                    want.lines().nth(first)
-                );
-                mismatches.push(case["name"].as_str().unwrap().to_owned());
-                // These upstream captures predate the specification's whole-line wrapping.
-                // Keep both reviewed Rust snapshots and verify the only extra content is
-                // the command's continuation or the final word of the launch message.
-                let (snapshot, additions): (&str, &[&str]) = match file {
-                    "screens/build-failed.txt" => (
-                        include_str!("../tests/snapshots/build-failed.txt"),
-                        &[
-                            " build -project Puzzle.xcodeproj -scheme Puzzle -destination plat",
-                            "form=iOS Simulator,id=A",
-                        ],
-                    ),
-                    "screens/run-attached-build-row.txt" => (
-                        include_str!("../tests/snapshots/run-attached-build-row.txt"),
-                        &["bove."],
-                    ),
-                    _ => panic!("unexpected upstream screen mismatch: {file}"),
-                };
-                assert_eq!(
-                    got, snapshot,
-                    "reviewed Rust wrapping snapshot changed: {file}"
-                );
-                let left = (size.0 / 3).max(32) as usize;
-                let extract = |text: &str, remove: bool| -> Vec<String> {
-                    text.lines()
-                        .take(size.1 as usize - 1)
-                        .filter_map(|row| {
-                            let right = row.chars().skip(left).collect::<String>();
-                            let content = right
-                                .trim_start_matches('│')
-                                .trim_end_matches('│')
-                                .trim_end()
-                                .to_string();
-                            if content.is_empty()
-                                || (remove && additions.contains(&content.as_str()))
-                            {
-                                None
-                            } else {
-                                Some(content)
-                            }
-                        })
-                        .collect()
-                };
-                for (g, w) in got.lines().zip(want.lines()).take(size.1 as usize - 1) {
-                    assert_eq!(
-                        g.chars().take(left).collect::<String>(),
-                        w.chars().take(left).collect::<String>(),
-                        "left pane diverged"
-                    );
-                }
-                assert_eq!(
-                    extract(&got, true),
-                    extract(&want, false),
-                    "difference beyond documented wrapped continuation: {file}"
-                );
-            }
-        }
-        eprintln!(
-            "upstream TUI screens: {}/{} exact matches",
-            cases.len() - mismatches.len(),
-            cases.len()
-        );
-        assert_eq!(
-            mismatches,
-            ["build failed", "run attached, cursor on the run row"],
-            "unexpected upstream screen differences"
-        );
-    }
-}
-
-#[cfg(test)]
-mod mouse_tests {
-    use super::*;
     use ratatui::backend::TestBackend;
 
-    fn render(app: &mut App) {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| draw(app, frame)).unwrap();
+    fn app() -> App {
+        let (tx, rx) = mpsc::channel();
+        // A real (empty) project folder, so revalidation sees it as unchanged.
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::create_dir_all(dir.join("Puzzle.xcodeproj")).unwrap();
+        let project = Project::find(&dir).unwrap();
+        App {
+            root: dir,
+            project,
+            schemes: vec![
+                Scheme {
+                    name: "Puzzle".into(),
+                    package: false,
+                },
+                Scheme {
+                    name: "PuzzleKit".into(),
+                    package: true,
+                },
+            ],
+            destinations: vec![
+                Destination {
+                    name: "iPhone 17".into(),
+                    runtime: "iOS 26.0".into(),
+                    state: "Shutdown".into(),
+                    udid: "SIM".into(),
+                    device: false,
+                },
+                Destination {
+                    name: "My iPhone".into(),
+                    runtime: "iOS 26.0".into(),
+                    state: String::new(),
+                    udid: "DEV".into(),
+                    device: true,
+                },
+            ],
+            scheme: Some(0),
+            destination: Some(1),
+            schemes_loaded: true,
+            destinations_loaded: true,
+            want_scheme: String::new(),
+            want_destination: String::new(),
+            jobs: vec![],
+            shown: 0,
+            phase: 0,
+            live: None,
+            follow: true,
+            top: 0,
+            problems_only: false,
+            filter: String::new(),
+            typing: false,
+            popup: None,
+            toast: None,
+            tx,
+            rx,
+            background: vec![],
+            log_area: Rect::new(1, 7, 78, 15),
+            popup_area: Rect::default(),
+            tick: 0,
+            focused: true,
+            last_check: Instant::now(),
+            test_mode: true,
+        }
     }
-    fn wheel(app: &mut App, pane: usize, kind: MouseEventKind) {
-        let area = app.pane_areas[pane];
-        app.mouse(MouseEvent {
-            kind,
-            column: area.x + 1,
-            row: area.y + 1,
-            modifiers: KeyModifiers::NONE,
-        });
+    fn press(app: &mut App, term: &mut Terminal<TestBackend>, code: KeyCode) {
+        app.key(KeyEvent::from(code), term).unwrap();
     }
+    fn screen(app: &mut App, term: &mut Terminal<TestBackend>) -> String {
+        term.draw(|f| draw(app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+    fn term() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(80, 24)).unwrap()
+    }
+
     #[test]
-    fn wheel_scrolls_hovered_log_and_resumes_follow_at_tail() {
-        let mut app = spec_tests::fixture();
-        let mut job = Job::new("build");
-        for i in 0..100 {
-            job.line(format!("line {i}"));
+    fn idle_screen_has_one_primary_action() {
+        let mut a = app();
+        let mut t = term();
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("Puzzle"), "{s}");
+        assert!(s.contains("◆ Puzzle"));
+        assert!(s.contains("▯ My iPhone"));
+        assert!(s.contains("▶ r  Run on My iPhone"));
+        assert!(s.contains("Ready to run on My iPhone"));
+    }
+
+    #[test]
+    fn build_shows_progress_then_failure_card() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('b'));
+        assert!(a.busy());
+        for line in [
+            "Target dependency graph (2 targets)",
+            "SwiftCompile normal arm64 /src/Puzzle/Board.swift (in target 'Puzzle' from project 'Puzzle')",
+        ] {
+            a.apply(Event::Line(line.into()));
         }
-        app.jobs.push(job);
-        render(&mut app);
-        let tail = tail_offset(&app.line_groups(), app.detail_height);
-        wheel(&mut app, 0, MouseEventKind::ScrollUp);
-        assert_eq!(app.focus, 0);
-        assert_eq!(app.views[&(0, 0)].offset, tail - 3);
-        assert!(!app.views[&(0, 0)].follow);
-        app.jobs[0].line("new output".into());
-        render(&mut app);
-        assert_eq!(app.views[&(0, 0)].offset, tail - 3);
-        for _ in 0..3 {
-            wheel(&mut app, 0, MouseEventKind::ScrollDown);
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("Compiling  Board.swift"), "{s}");
+        assert!(s.contains("1 of 2 targets"), "{s}");
+        assert!(s.contains('%'));
+        assert!(s.contains("■ x  Stop"));
+        a.apply(Event::Line(
+            "/src/Puzzle/Board.swift:12:5: error: cannot find 'tile' in scope".into(),
+        ));
+        a.apply(Event::Line("error: exit status 65".into()));
+        a.apply(Event::Done {
+            code: 65,
+            stopped: false,
+        });
+        assert!(!a.busy());
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("✗ Build failed"), "{s}");
+        assert!(
+            s.contains("Board.swift:12  cannot find 'tile' in scope"),
+            "{s}"
+        );
+        assert!(s.contains("problems"), "{s}");
+    }
+
+    #[test]
+    fn run_switches_to_console_when_attached() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('r'));
+        a.apply(Event::Line("** BUILD SUCCEEDED **".into()));
+        a.apply(Event::State("installing".into()));
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("Installing on My iPhone"), "{s}");
+        a.apply(Event::State("launching".into()));
+        a.apply(Event::Attached("com.example.Puzzle".into()));
+        a.apply(Event::Console("hello from the app".into()));
+        assert_eq!(a.phase, 1);
+        let s = screen(&mut a, &mut t);
+        assert!(
+            s.contains("Running com.example.Puzzle on My iPhone"),
+            "{s}"
+        );
+        assert!(s.contains("hello from the app"));
+        assert!(s.contains("Stop app"));
+        press(&mut a, &mut t, KeyCode::Tab);
+        assert_eq!(a.phase, 0);
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("BUILD SUCCEEDED"), "{s}");
+    }
+
+    #[test]
+    fn pickers_filter_and_select() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('d'));
+        // Physical devices are listed first.
+        assert_eq!(a.device_rows(""), vec![1, 0]);
+        for c in "17".chars() {
+            press(&mut a, &mut t, KeyCode::Char(c));
         }
-        assert!(app.views[&(0, 0)].follow);
-        assert_eq!(
-            app.views[&(0, 0)].offset,
-            tail_offset(&app.line_groups(), app.detail_height)
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("/17"), "{s}");
+        press(&mut a, &mut t, KeyCode::Enter);
+        assert_eq!(a.destination, Some(0));
+        assert!(a.popup.is_none());
+        press(&mut a, &mut t, KeyCode::Char('s'));
+        press(&mut a, &mut t, KeyCode::Down);
+        press(&mut a, &mut t, KeyCode::Enter);
+        assert_eq!(a.scheme, Some(1));
+    }
+
+    #[test]
+    fn run_without_a_device_opens_the_picker() {
+        let mut a = app();
+        let mut t = term();
+        a.destination = None;
+        press(&mut a, &mut t, KeyCode::Char('r'));
+        assert!(!a.busy());
+        assert!(matches!(a.popup, Some(Popup::Devices { .. })));
+    }
+
+    #[test]
+    fn scrolling_pauses_and_resumes_follow() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('b'));
+        for n in 0..500 {
+            a.apply(Event::Line(format!("line {n}")));
+        }
+        screen(&mut a, &mut t);
+        assert!(a.follow);
+        press(&mut a, &mut t, KeyCode::Up);
+        assert!(!a.follow);
+        let s = screen(&mut a, &mut t);
+        assert!(!s.contains("line 499"), "{s}");
+        assert!(s.contains("G follow"));
+        press(&mut a, &mut t, KeyCode::Char('G'));
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("line 499"));
+        press(&mut a, &mut t, KeyCode::Char('g'));
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("line 0 "), "{s}");
+        for _ in 0..100 {
+            press(&mut a, &mut t, KeyCode::PageDown);
+        }
+        assert!(a.follow);
+    }
+
+    #[test]
+    fn history_opens_an_older_run() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('b'));
+        a.apply(Event::Line("first".into()));
+        a.apply(Event::Done {
+            code: 0,
+            stopped: false,
+        });
+        press(&mut a, &mut t, KeyCode::Char('c'));
+        a.apply(Event::Done {
+            code: 0,
+            stopped: false,
+        });
+        press(&mut a, &mut t, KeyCode::Char('h'));
+        press(&mut a, &mut t, KeyCode::Down);
+        press(&mut a, &mut t, KeyCode::Enter);
+        assert_eq!(a.shown, 1);
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("Build succeeded"), "{s}");
+        assert!(s.contains("first"));
+        press(&mut a, &mut t, KeyCode::Esc);
+        assert_eq!(a.shown, 0);
+    }
+
+    #[test]
+    fn large_logs_render_quickly() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('b'));
+        for n in 0..200_000 {
+            a.apply(Event::Line(format!(
+                "CompileC /very/long/path/number/{n}/file.m normal arm64 objective-c (in target 'Kit' from project 'Pods')"
+            )));
+        }
+        let began = Instant::now();
+        for _ in 0..20 {
+            screen(&mut a, &mut t);
+        }
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "20 frames took {:?}",
+            began.elapsed()
         );
     }
+
     #[test]
-    fn wheel_targets_list_without_changing_selected_destination() {
-        let mut app = spec_tests::fixture();
-        render(&mut app);
-        let selected = app.destination;
-        wheel(&mut app, 3, MouseEventKind::ScrollDown);
-        assert_eq!(app.focus, 3);
-        assert!(app.destination_cursor > 0);
-        assert_eq!(app.destination, selected);
-        wheel(&mut app, 3, MouseEventKind::ScrollUp);
-        assert_eq!(app.destination_cursor, 0);
-    }
-    #[test]
-    fn wheel_uses_expanded_layout_and_ignores_popups_filters_and_footer() {
-        let mut app = spec_tests::fixture();
-        app.expanded = true;
-        app.last_left = 3;
-        render(&mut app);
-        assert_eq!(app.pane_areas[2], Rect::default());
-        wheel(&mut app, 3, MouseEventKind::ScrollDown);
-        let cursor = app.destination_cursor;
-        app.popup = Some(Popup::Help);
-        wheel(&mut app, 3, MouseEventKind::ScrollUp);
-        assert_eq!(app.destination_cursor, cursor);
-        app.popup = None;
-        app.typing = true;
-        wheel(&mut app, 3, MouseEventKind::ScrollUp);
-        assert_eq!(app.destination_cursor, cursor);
-        app.typing = false;
-        app.mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 1,
-            row: 29,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.destination_cursor, cursor);
+    fn helpers() {
+        assert_eq!(wrap("abc def", 4), vec!["abc ", "def"]);
+        assert_eq!(wrap("a界b", 2), vec!["a", "界", "b"]);
+        assert_eq!(wrapped_rows("abcdefgh", 4), 2);
+        assert_eq!(wrapped_rows("", 4), 1);
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(clean("50%\r100%"), "100%");
+        assert_eq!(clock(125.0), "2:05");
+        assert!(contains("My iPhone", "IPHONE"));
     }
 }

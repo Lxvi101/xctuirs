@@ -95,8 +95,14 @@ fn workflow(
     tx: &SyncSender<Event>,
 ) -> Result<i32> {
     let _lock = BuildLock::acquire(project)?;
-    ensure_build_space(&project.root, 20 * 1024 * 1024 * 1024)?;
-    let args = if action == "resolve" {
+    let free = ensure_build_space(&project.root, START_FREE_DISK)?;
+    if free < LOW_FREE_DISK {
+        let _ = tx.send(Event::Line(format!(
+            "warning: only {:.1} GiB of disk space free; large builds may fail",
+            gib(free)
+        )));
+    }
+    let mut args = if action == "resolve" {
         xcode::resolve_args(project)
     } else {
         xcode::action_args(
@@ -106,13 +112,15 @@ fn workflow(
             destination,
         )
     };
+    args.extend(extra_build_args(action, destination));
     let _ = tx.send(Event::State(
         if action == "run" { "building" } else { action }.into(),
     ));
     let mut command = Command::new("xcodebuild");
     command
         .args(args)
-        .args(["-jobs", "1"])
+        // Line-by-line output keeps the progress bar and log live.
+        .env("NSUnbufferedIO", "YES")
         .current_dir(&project.root);
     let process = Process::spawn(command)?;
     let code = process.finish(stop, libc::SIGTERM, |line| {
@@ -133,6 +141,32 @@ fn workflow(
         "▸ Installing and launching on {}",
         destination.name
     )));
+    let stream = |program: &str, args: &[String]| -> Result<()> {
+        if stop.load(Ordering::SeqCst) {
+            bail!("stopped");
+        }
+        let mut command = Command::new(program);
+        command.args(args).current_dir(&project.root);
+        let mut tail: Vec<String> = vec![];
+        let code = Process::spawn(command)?.finish(stop, libc::SIGTERM, |line| {
+            if tail.len() == 20 {
+                tail.remove(0);
+            }
+            tail.push(line.clone());
+            let _ = tx.send(Event::Line(line));
+        })?;
+        if stop.load(Ordering::SeqCst) {
+            bail!("stopped");
+        }
+        if code != 0 {
+            bail!(
+                "{program} {}: exit status {code}: {}",
+                args.join(" "),
+                tail.join("\n").trim()
+            );
+        }
+        Ok(())
+    };
     let mut settings_args = vec!["-showBuildSettings".to_owned(), "-json".to_owned()];
     settings_args.extend(project.container_args());
     settings_args.extend([
@@ -145,7 +179,7 @@ fn workflow(
     let settings = xcode::parse_build_settings(&json, &destination.platform_name())?;
     let app_path = settings.app_path.to_string_lossy().into_owned();
     if destination.device {
-        capture(
+        stream(
             "xcrun",
             &strings(&[
                 "devicectl",
@@ -156,7 +190,6 @@ fn workflow(
                 &destination.udid,
                 &app_path,
             ]),
-            stop,
         )?;
     } else if !destination.is_mac() {
         let boot = capture(
@@ -170,15 +203,15 @@ fn workflow(
             return Err(error);
         }
         capture("open", &strings(&["-a", "Simulator"]), stop)?;
-        capture(
+        stream(
             "xcrun",
             &strings(&["simctl", "install", &destination.udid, &app_path]),
-            stop,
         )?;
     }
     if stop.load(Ordering::SeqCst) {
         return Ok(130);
     }
+    let _ = tx.send(Event::State("launching".into()));
     let mut launch = if destination.is_mac() {
         let mut cmd = Command::new(&settings.executable);
         cmd.env("OS_ACTIVITY_DT_MODE", "YES");
@@ -283,6 +316,57 @@ fn workflow(
     Ok(0) // app exit status is a console event, not a failed build.
 }
 
+/// Flags added to every build-like xcodebuild invocation.
+///
+/// * `-jobs N` bounds parallel compiler processes by installed memory (about
+///   one per 3 GiB, at least 2, at most the CPU count). `XCTUIRS_JOBS=N`
+///   overrides it; `XCTUIRS_JOBS=0` leaves parallelism to xcodebuild.
+/// * `-hideShellScriptEnvironment` drops the multi-kilobyte environment dump
+///   printed for every script phase.
+/// * `-allowProvisioningUpdates` lets device builds create or refresh signing
+///   profiles the way Xcode does, using the accounts already added to Xcode.
+pub fn extra_build_args(action: &str, destination: &Destination) -> Vec<String> {
+    if action == "resolve" {
+        return vec![];
+    }
+    let mut args = vec![];
+    if let Some(jobs) = parallel_jobs() {
+        args.extend(["-jobs".to_owned(), jobs.to_string()]);
+    }
+    if action != "clean" {
+        args.push("-hideShellScriptEnvironment".to_owned());
+        if destination.device {
+            args.push("-allowProvisioningUpdates".to_owned());
+        }
+    }
+    args
+}
+pub fn parallel_jobs() -> Option<usize> {
+    if let Some(value) = std::env::var_os("XCTUIRS_JOBS")
+        && let Some(n) = value.to_str().and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return (n > 0).then_some(n);
+    }
+    let cores = thread::available_parallelism().map_or(4, |n| n.get());
+    let memory = physical_memory().unwrap_or(8 << 30);
+    Some(((memory >> 30) as usize / 3).clamp(2, cores.max(2)))
+}
+fn physical_memory() -> Option<u64> {
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let name = c"hw.memsize";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&mut value as *mut u64).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value)
+}
+
 fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).into()).collect()
 }
@@ -350,20 +434,30 @@ fn capture(name: &str, args: &[String], stop: &Arc<AtomicBool>) -> Result<String
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
-const MIN_FREE_DISK: u64 = 10 * 1024 * 1024 * 1024;
-fn ensure_build_space(project_root: &std::path::Path, minimum: u64) -> Result<()> {
-    ensure_disk_space(project_root, minimum)?;
+const GIB: u64 = 1024 * 1024 * 1024;
+/// Refuse to start below this: there is no room for build products or swap.
+const START_FREE_DISK: u64 = 3 * GIB;
+/// Warn (but build) below this.
+const LOW_FREE_DISK: u64 = 10 * GIB;
+/// Stop a running build below this, before the startup disk is completely full.
+const MIN_FREE_DISK: u64 = GIB;
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / GIB as f64
+}
+/// Returns the smallest free space among the volumes a build writes to.
+fn ensure_build_space(project_root: &std::path::Path, minimum: u64) -> Result<u64> {
+    let mut free = ensure_disk_space(project_root, minimum)?;
     // DerivedData and macOS swap normally live on the home/startup volume,
     // which can differ from a project on an external drive.
     if let Some(home) = std::env::var_os("HOME") {
         let home = std::path::PathBuf::from(home);
         if home != project_root {
-            ensure_disk_space(&home, minimum)?;
+            free = free.min(ensure_disk_space(&home, minimum)?);
         }
     }
-    Ok(())
+    Ok(free)
 }
-fn ensure_disk_space(path: &std::path::Path, minimum: u64) -> Result<()> {
+fn ensure_disk_space(path: &std::path::Path, minimum: u64) -> Result<u64> {
     let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
@@ -372,14 +466,15 @@ fn ensure_disk_space(path: &std::path::Path, minimum: u64) -> Result<()> {
     }
     let stats = unsafe { stats.assume_init() };
     let available = (stats.f_bavail as u64).saturating_mul(stats.f_frsize);
-    validate_available_disk(available, minimum)
+    validate_available_disk(available, minimum)?;
+    Ok(available)
 }
 fn validate_available_disk(available: u64, minimum: u64) -> Result<()> {
     if available < minimum {
         bail!(
             "build stopped: {:.1} GiB free; xctuirs requires at least {} GiB of free disk space for build output and macOS swap",
-            available as f64 / (1024.0 * 1024.0 * 1024.0),
-            minimum / (1024 * 1024 * 1024)
+            gib(available),
+            minimum / GIB
         );
     }
     Ok(())
@@ -498,7 +593,7 @@ impl Process {
         loop {
             if !stop.load(Ordering::SeqCst) && disk_checked.elapsed() >= Duration::from_secs(1) {
                 if let Some(path) = &self.disk_path
-                    && let Err(error) = ensure_build_space(path, MIN_FREE_DISK)
+                    && let Err(error) = ensure_build_space(path, MIN_FREE_DISK).map(|_| ())
                 {
                     emit(format!("error: {error}"));
                     stop.store(true, Ordering::SeqCst);
@@ -829,7 +924,7 @@ while True:time.sleep(.05)
             validate_available_disk(MIN_FREE_DISK - 1, MIN_FREE_DISK)
                 .unwrap_err()
                 .to_string()
-                .contains("at least 10 GiB")
+                .contains("at least 1 GiB")
         );
         assert!(validate_available_disk(MIN_FREE_DISK, MIN_FREE_DISK).is_ok());
     }

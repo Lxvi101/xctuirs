@@ -180,6 +180,12 @@ fn physical_device_installs_launches_and_propagates_console_environment() {
         String::from_utf8_lossy(&output.stderr)
     );
     let calls = s.calls();
+    let build = calls
+        .iter()
+        .find(|c| c["tool"] == "xcodebuild" && args(c).first() == Some(&"build"))
+        .unwrap();
+    // Device builds refresh signing profiles the way Xcode does.
+    assert!(args(build).contains(&"-allowProvisioningUpdates"));
     let install = calls
         .iter()
         .find(|c| args(c).starts_with(&["devicectl", "device", "install", "app"]))
@@ -316,7 +322,13 @@ fn separate_cli_instances_cannot_build_the_same_project_concurrently() {
         .into_iter()
         .find(|call| call["tool"] == "xcodebuild")
         .unwrap();
-    assert!(args(&build).ends_with(&["-jobs", "1"]));
+    let jobs = xctuirs::runtime::parallel_jobs().unwrap().to_string();
+    let a = args(&build);
+    let at = a.iter().position(|x| *x == "-jobs").expect("bounded -jobs");
+    assert_eq!(a[at + 1], jobs);
+    // Simulator builds never ask for provisioning updates.
+    assert!(!a.contains(&"-allowProvisioningUpdates"));
+    assert!(a.contains(&"-hideShellScriptEnvironment"));
     unsafe {
         libc::kill(first.id() as i32, libc::SIGINT);
     }

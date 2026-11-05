@@ -10,6 +10,17 @@ pub struct Phase {
     lazy_path: Option<std::path::PathBuf>,
     #[serde(skip)]
     saved_counts: Option<(usize, usize)>,
+    /// Incremental issue index so large logs never need a full rescan per frame.
+    #[serde(skip)]
+    index: IssueIndex,
+}
+#[derive(Clone, Debug, Default)]
+struct IssueIndex {
+    indexed: usize,
+    issues: Vec<usize>,
+    seen: HashSet<String>,
+    errors: usize,
+    warnings: usize,
 }
 impl Phase {
     pub fn new(name: &str) -> Self {
@@ -18,6 +29,7 @@ impl Phase {
             lines: vec![],
             lazy_path: None,
             saved_counts: None,
+            index: IssueIndex::default(),
         }
     }
     pub fn from_history(
@@ -31,6 +43,7 @@ impl Phase {
             lines: vec![],
             lazy_path: Some(path),
             saved_counts: Some((errors, warnings)),
+            index: IssueIndex::default(),
         }
     }
     pub fn is_loaded(&self) -> bool {
@@ -45,19 +58,63 @@ impl Phase {
                     .collect(),
                 Err(e) => vec![format!("(log missing: {e})")],
             };
+            self.index = IssueIndex::default();
+            self.reindex();
         }
     }
-    pub fn issues(&self) -> Vec<String> {
+    fn reindex(&mut self) {
+        if self.index.indexed > self.lines.len() {
+            self.index = IssueIndex::default();
+        }
+        while self.index.indexed < self.lines.len() {
+            let i = self.index.indexed;
+            let line = &self.lines[i];
+            let k = kind(line);
+            if k != "plain" && self.index.seen.insert(line.clone()) {
+                self.index.issues.push(i);
+                if k == "error" {
+                    self.index.errors += 1;
+                } else {
+                    self.index.warnings += 1;
+                }
+            }
+            self.index.indexed += 1;
+        }
+    }
+    pub fn push(&mut self, line: String) {
+        self.ensure_loaded();
+        self.saved_counts = None;
+        self.reindex();
+        self.lines.push(line);
+        self.reindex();
+    }
+    /// Line numbers of distinct errors and warnings, in log order.
+    pub fn issue_indices(&self) -> std::borrow::Cow<'_, [usize]> {
+        if self.index.indexed == self.lines.len() {
+            return std::borrow::Cow::Borrowed(&self.index.issues);
+        }
         let mut seen = HashSet::new();
-        self.lines
+        std::borrow::Cow::Owned(
+            self.lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| kind(l) != "plain" && seen.insert(l.as_str()))
+                .map(|(i, _)| i)
+                .collect(),
+        )
+    }
+    pub fn issues(&self) -> Vec<String> {
+        self.issue_indices()
             .iter()
-            .filter(|l| kind(l) != "plain" && seen.insert((*l).clone()))
-            .cloned()
+            .map(|&i| self.lines[i].clone())
             .collect()
     }
     pub fn counts(&self) -> (usize, usize) {
         if let Some(counts) = self.saved_counts {
             return counts;
+        }
+        if self.index.indexed == self.lines.len() {
+            return (self.index.errors, self.index.warnings);
         }
         let issues = self.issues();
         (
@@ -127,9 +184,7 @@ impl Job {
     }
     pub fn line(&mut self, line: String) {
         if let Some(p) = self.phases.last_mut() {
-            p.ensure_loaded();
-            p.saved_counts = None;
-            p.lines.push(line)
+            p.push(line)
         }
     }
     pub fn build_finished(&mut self) {

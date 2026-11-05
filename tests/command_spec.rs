@@ -300,7 +300,11 @@ fn upstream_commands_23_cases() {
         let case = format!("action:{}", text(&fixture["job"]));
         let rows = invoke(&case, "iphonesimulator", "Puzzle.app/Puzzle", "");
         let mut expected = list(&fixture["argv"]);
-        expected.extend(["-jobs".into(), "1".into()]);
+        // Safety/reliability flags added on top of the upstream argv.
+        expected.extend(xctuirs::runtime::extra_build_args(
+            text(&fixture["job"]),
+            &Destination::default(),
+        ));
         assert_eq!(argv(&rows[0]), expected);
         assert_eq!(
             rows.last().unwrap()["signal"].as_str(),

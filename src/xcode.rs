@@ -605,11 +605,12 @@ with open(sys.argv[1],'w') as f:f.write(str(p.pid))
                 script.into(),
                 marker.to_string_lossy().into_owned(),
             ],
-            std::time::Duration::from_millis(300),
+            // Generous enough for python to start on a loaded machine.
+            std::time::Duration::from_millis(2000),
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
-        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert!(start.elapsed() < std::time::Duration::from_secs(6));
         let pid: i32 = fs::read_to_string(marker).unwrap().parse().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {

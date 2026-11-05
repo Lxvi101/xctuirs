@@ -154,3 +154,27 @@ pub fn delete_history(p: &Project) -> Result<()> {
     }
     Ok(())
 }
+
+type Estimates = BTreeMap<String, BTreeMap<String, crate::progress::Estimate>>;
+fn load_estimates(c: &std::path::Path) -> Estimates {
+    fs::read(c.join("estimates.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+/// Duration and task count of the last successful build for `key` (scheme + destination + action).
+pub fn load_estimate(p: &Project, key: &str) -> Option<crate::progress::Estimate> {
+    let c = config()?;
+    load_estimates(&c)
+        .remove(&p.name.to_string_lossy().into_owned())?
+        .remove(key)
+}
+pub fn save_estimate(p: &Project, key: &str, estimate: crate::progress::Estimate) -> Result<()> {
+    let Some(c) = config() else { return Ok(()) };
+    fs::create_dir_all(&c)?;
+    let mut all = load_estimates(&c);
+    all.entry(p.name.to_string_lossy().into_owned())
+        .or_default()
+        .insert(key.to_owned(), estimate);
+    atomic_write(&c.join("estimates.json"), &serde_json::to_vec_pretty(&all)?)
+}
