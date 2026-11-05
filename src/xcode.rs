@@ -83,13 +83,66 @@ impl fmt::Display for Scheme {
     }
 }
 
-pub fn scheme_files(project: &Project) -> Result<Vec<String>> {
+/// The container plus, for a workspace, the projects it references.
+fn scheme_roots(project: &Project) -> Result<Vec<PathBuf>> {
     let mut roots = vec![project.name.clone()];
     if project.name.extension().is_some_and(|x| x == "xcworkspace")
         && let Some(parent) = project.name.parent()
     {
-        roots.extend(matching(parent, "*.xcodeproj")?);
+        match fs::read_to_string(project.name.join("contents.xcworkspacedata")) {
+            Ok(text) => roots.extend(workspace_projects(&text, parent, &project.name)),
+            // Unreadable workspace description: fall back to sibling projects.
+            Err(_) => roots.extend(matching(parent, "*.xcodeproj")?),
+        }
     }
+    Ok(roots)
+}
+/// Project paths a workspace's contents.xcworkspacedata refers to. Only these
+/// contribute schemes xcodebuild will accept for the workspace.
+pub fn workspace_projects(text: &str, parent: &Path, workspace: &Path) -> Vec<PathBuf> {
+    let re = Regex::new(r#"location\s*=\s*"(group|container|absolute|self):([^"]+\.xcodeproj)""#)
+        .expect("valid regex");
+    re.captures_iter(text)
+        .map(|c| match &c[1] {
+            "absolute" => PathBuf::from(&c[2]),
+            "self" => workspace.join(&c[2]),
+            _ => parent.join(&c[2]),
+        })
+        .filter(|p| p.is_dir())
+        .collect()
+}
+/// The target the scheme's Run action launches, from its .xcscheme file.
+pub fn runnable_target(project: &Project, scheme: &Scheme) -> Option<String> {
+    let block = Regex::new(r"(?s)<LaunchAction\b.*?</LaunchAction>").ok()?;
+    let name =
+        Regex::new(r#"(?s)<BuildableProductRunnable\b.*?BlueprintName\s*=\s*"([^"]+)""#).ok()?;
+    for root in scheme_roots(project).ok()? {
+        for pattern in [
+            format!(
+                "xcshareddata/xcschemes/{}.xcscheme",
+                glob::Pattern::escape(&scheme.name)
+            ),
+            format!(
+                "xcuserdata/*/xcschemes/{}.xcscheme",
+                glob::Pattern::escape(&scheme.name)
+            ),
+        ] {
+            for path in matching(&root, &pattern).ok()? {
+                let Ok(text) = fs::read_to_string(path) else {
+                    continue;
+                };
+                if let Some(launch) = block.find(&text)
+                    && let Some(c) = name.captures(launch.as_str())
+                {
+                    return Some(c[1].to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+pub fn scheme_files(project: &Project) -> Result<Vec<String>> {
+    let roots = scheme_roots(project)?;
     let mut names = BTreeSet::new();
     for root in roots {
         for pattern in [
@@ -170,7 +223,12 @@ pub fn schemes(project: &Project) -> Result<Vec<Scheme>> {
     if names.is_empty() {
         let mut args = vec!["-list".into(), "-json".into()];
         args.extend(project.container_args());
-        names = parse_scheme_list(&one_shot("xcodebuild", &args)?)?;
+        // Large workspaces (and first-time package resolution) list slowly.
+        names = parse_scheme_list(&one_shot_with_timeout(
+            "xcodebuild",
+            &args,
+            std::time::Duration::from_secs(90),
+        )?)?;
     }
     Ok(merge_schemes(names, package_products(&project.root)?))
 }
@@ -352,16 +410,38 @@ pub fn sort_simulators(list: &mut [Destination]) {
     });
 }
 pub fn destinations() -> Result<Vec<Destination>> {
-    let sims = parse_simulators(&one_shot(
-        "xcrun",
-        &["simctl", "list", "devices", "available", "-j"].map(str::to_owned),
-    )?)?;
-    let devices = one_shot(
-        "xcrun",
-        &["devicectl", "list", "devices", "--json-output", "-", "-q"].map(str::to_owned),
-    )
-    .and_then(|s| parse_devices(&s))
-    .unwrap_or_default();
+    let timeout = std::time::Duration::from_secs(45);
+    // Simulators and devices come from separate services; either may be slow
+    // to start. One failing must not hide the other.
+    let (sims, devices) = std::thread::scope(|scope| {
+        let sims = scope.spawn(|| {
+            one_shot_with_timeout(
+                "xcrun",
+                &["simctl", "list", "devices", "available", "-j"].map(str::to_owned),
+                timeout,
+            )
+            .and_then(|s| parse_simulators(&s))
+        });
+        let devices = scope.spawn(|| {
+            one_shot_with_timeout(
+                "xcrun",
+                &["devicectl", "list", "devices", "--json-output", "-", "-q"].map(str::to_owned),
+                timeout,
+            )
+            .and_then(|s| parse_devices(&s))
+        });
+        (
+            sims.join()
+                .unwrap_or_else(|_| Err(anyhow!("simulator listing panicked"))),
+            devices
+                .join()
+                .unwrap_or_else(|_| Err(anyhow!("device listing panicked"))),
+        )
+    });
+    let (sims, devices) = match (sims, devices) {
+        (Err(e), Err(_)) => return Err(e),
+        (s, d) => (s.unwrap_or_default(), d.unwrap_or_default()),
+    };
     let mut out = vec![Destination {
         name: "My Mac".into(),
         runtime: "macOS".into(),
@@ -413,8 +493,21 @@ pub struct BuildSettings {
     pub executable: PathBuf,
 }
 pub fn parse_build_settings(json: &str, platform: &str) -> Result<BuildSettings> {
-    let targets: Vec<Value> =
+    parse_build_settings_for(json, platform, None)
+}
+/// Like [`parse_build_settings`], preferring the target named `runnable`
+/// (the scheme's Run action) when a scheme builds several apps.
+pub fn parse_build_settings_for(
+    json: &str,
+    platform: &str,
+    runnable: Option<&str>,
+) -> Result<BuildSettings> {
+    let mut targets: Vec<Value> =
         serde_json::from_str(json).context("invalid xcodebuild settings JSON")?;
+    if let Some(name) = runnable {
+        // Stable sort: the runnable target first, others keep their order.
+        targets.sort_by_key(|t| t["target"].as_str() != Some(name));
+    }
     for target in targets {
         let settings = &target["buildSettings"];
         if settings["WRAPPER_EXTENSION"].as_str() != Some("app")
@@ -620,6 +713,66 @@ with open(sys.argv[1],'w') as f:f.write(str(p.pid))
             unsafe { libc::kill(pid, 0) },
             0,
             "timed-out discovery left a child alive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scheme_scope_tests {
+    use super::*;
+    #[test]
+    fn workspace_schemes_come_from_referenced_projects_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for p in ["App.xcodeproj", "Old.xcodeproj", "Pods/Pods.xcodeproj"] {
+            fs::create_dir_all(root.join(p).join("xcshareddata/xcschemes")).unwrap();
+        }
+        fs::write(root.join("App.xcodeproj/xcshareddata/xcschemes/App.xcscheme"), "<Scheme><LaunchAction><BuildableProductRunnable><BuildableReference BlueprintName = \"AppTarget\"/></BuildableProductRunnable></LaunchAction></Scheme>").unwrap();
+        fs::write(
+            root.join("Old.xcodeproj/xcshareddata/xcschemes/Old.xcscheme"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Pods/Pods.xcodeproj/xcshareddata/xcschemes/Pod.xcscheme"),
+            "",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("App.xcworkspace")).unwrap();
+        fs::write(
+            root.join("App.xcworkspace/contents.xcworkspacedata"),
+            r#"<Workspace version = "1.0"><FileRef location = "group:App.xcodeproj"></FileRef><FileRef location = "group:Pods/Pods.xcodeproj"></FileRef></Workspace>"#,
+        )
+        .unwrap();
+        let project = Project {
+            name: root.join("App.xcworkspace"),
+            root: root.to_owned(),
+        };
+        assert_eq!(scheme_files(&project).unwrap(), ["App", "Pod"]);
+        let scheme = Scheme {
+            name: "App".into(),
+            package: false,
+        };
+        assert_eq!(
+            runnable_target(&project, &scheme).as_deref(),
+            Some("AppTarget")
+        );
+    }
+    #[test]
+    fn runnable_target_wins_over_json_order() {
+        let json = r#"[
+          {"target":"Helper","buildSettings":{"WRAPPER_EXTENSION":"app","PLATFORM_NAME":"iphoneos","BUILT_PRODUCTS_DIR":"/b","FULL_PRODUCT_NAME":"Helper.app","PRODUCT_BUNDLE_IDENTIFIER":"h","EXECUTABLE_PATH":"Helper.app/Helper"}},
+          {"target":"Main","buildSettings":{"WRAPPER_EXTENSION":"app","PLATFORM_NAME":"iphoneos","BUILT_PRODUCTS_DIR":"/b","FULL_PRODUCT_NAME":"Main.app","PRODUCT_BUNDLE_IDENTIFIER":"m","EXECUTABLE_PATH":"Main.app/Main"}}
+        ]"#;
+        assert_eq!(
+            parse_build_settings(json, "iphoneos").unwrap().bundle_id,
+            "h"
+        );
+        assert_eq!(
+            parse_build_settings_for(json, "iphoneos", Some("Main"))
+                .unwrap()
+                .bundle_id,
+            "m"
         );
     }
 }

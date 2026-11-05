@@ -19,7 +19,7 @@ with open(os.environ['WORKFLOW_CALLS'],'a') as f: f.write(json.dumps(row)+'\n')
 scenario=os.environ['WORKFLOW_CASE']
 if name=='xcodebuild':
     if '-showBuildSettings' in a:
-        platform='macosx' if scenario=='mac' else ('iphoneos' if scenario=='device' else 'iphonesimulator')
+        platform='macosx' if scenario=='mac' else ('iphoneos' if scenario in ('device','launch-refused') else 'iphonesimulator')
         print(json.dumps([{'target':'Puzzle','buildSettings':{'WRAPPER_EXTENSION':'app','PLATFORM_NAME':platform,'BUILT_PRODUCTS_DIR':os.environ['WORKFLOW_ROOT'],'FULL_PRODUCT_NAME':'Puzzle.app','PRODUCT_BUNDLE_IDENTIFIER':'com.example.Puzzle','EXECUTABLE_PATH':'mac_app' if scenario=='mac' else 'Puzzle.app/Puzzle'}}]))
     elif scenario=='hold-build':
         signal.signal(signal.SIGTERM,lambda *args:sys.exit(0))
@@ -37,6 +37,10 @@ elif name=='xcrun' and (a[:2]==['simctl','install'] or a[:4]==['devicectl','devi
     if scenario=='install-failure':
         print('INSTALL DENIED',file=sys.stderr,flush=True); sys.exit(17)
 elif name=='mac_app' or (name=='xcrun' and (a[:2]==['simctl','launch'] or a[:4]==['devicectl','device','process','launch'])):
+    if scenario=='launch-refused':
+        print('ERROR: The device is locked.',file=sys.stderr,flush=True); sys.exit(1)
+    if name=='xcrun' and a[0]=='simctl': print('com.example.Puzzle: 4242',flush=True)
+    elif name=='xcrun': print('Launched application with com.example.Puzzle bundle identifier.',flush=True)
     print('APP CONSOLE LINE',flush=True)
     time.sleep(.15)
     sys.exit(7 if scenario=='app-nonzero' else 0)
@@ -257,6 +261,21 @@ fn install_failure_keeps_diagnostic_and_skips_launch() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("INSTALL DENIED"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("failed"));
     assert!(!s.calls().iter().any(is_launch));
+}
+
+#[test]
+fn refused_launch_fails_instead_of_reporting_an_exited_app() {
+    let s = Sandbox::new();
+    let output = s.finish(s.spawn("launch-refused", "DEVICE-FAKE"));
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("The device is locked"), "{stdout}");
+    assert!(
+        stdout.contains("couldn't launch com.example.Puzzle"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("▸ Launched"), "{stdout}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed"));
 }
 
 #[test]

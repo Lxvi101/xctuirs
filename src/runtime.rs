@@ -13,7 +13,7 @@ use std::{
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -56,7 +56,9 @@ impl Drop for Task {
 }
 
 pub fn start(action: &str, project: Project, scheme: Scheme, destination: Destination) -> Task {
-    let (tx, events) = mpsc::sync_channel(256);
+    // Unbounded: a slow consumer must never stall process supervision (and with
+    // it cancellation). Every line is kept in memory by the consumer anyway.
+    let (tx, events) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let stop = cancelled.clone();
     let action = action.to_owned();
@@ -92,9 +94,9 @@ fn workflow(
     scheme: &Scheme,
     destination: &Destination,
     stop: &Arc<AtomicBool>,
-    tx: &SyncSender<Event>,
+    tx: &Sender<Event>,
 ) -> Result<i32> {
-    let _lock = BuildLock::acquire(project)?;
+    let lock = BuildLock::acquire(project)?;
     let free = ensure_build_space(&project.root, START_FREE_DISK)?;
     if free < LOW_FREE_DISK {
         let _ = tx.send(Event::Line(format!(
@@ -176,7 +178,11 @@ fn workflow(
         destination.destination(),
     ]);
     let json = capture("xcodebuild", &settings_args, stop)?;
-    let settings = xcode::parse_build_settings(&json, &destination.platform_name())?;
+    // The scheme's Run action names the app to launch; without it, the first
+    // app for the platform is used.
+    let runnable = xcode::runnable_target(project, scheme);
+    let settings =
+        xcode::parse_build_settings_for(&json, &destination.platform_name(), runnable.as_deref())?;
     let app_path = settings.app_path.to_string_lossy().into_owned();
     if destination.device {
         stream(
@@ -245,9 +251,25 @@ fn workflow(
         cmd
     };
     launch.current_dir(&project.root);
+    // Building and installing are done; another session may build while the app runs.
+    drop(lock);
     let process = Process::spawn(launch)?;
-    let _ = tx.send(Event::Attached(settings.bundle_id.clone()));
-    let _ = tx.send(Event::State("attached".into()));
+    // simctl and devicectl report a successful launch before any app output.
+    // Attach only then, so a refused launch (locked phone, missing app) is a
+    // failure rather than an app that "exited".
+    let mut attached = false;
+    let attach = |attached: &mut bool| {
+        if !*attached {
+            *attached = true;
+            let _ = tx.send(Event::Attached(settings.bundle_id.clone()));
+            let _ = tx.send(Event::State("attached".into()));
+        }
+    };
+    if destination.is_mac() {
+        attach(&mut attached);
+    }
+    let launch_started = Instant::now();
+    let bundle_id = settings.bundle_id.clone();
     let log_stop = Arc::new(AtomicBool::new(false));
     let log_worker = if !destination.device {
         let mut command = Command::new("xcrun");
@@ -305,6 +327,17 @@ fn workflow(
             libc::SIGINT
         },
         |line| {
+            if !attached {
+                if launch_marker(&line, &bundle_id)
+                    || launch_started.elapsed() > Duration::from_secs(3)
+                {
+                    attach(&mut attached);
+                } else {
+                    // Tool preamble (device tunnel, disk image services).
+                    let _ = tx.send(Event::Line(line));
+                    return;
+                }
+            }
             let _ = tx.send(Event::Console(console_line(&line)));
         },
     );
@@ -312,7 +345,16 @@ fn workflow(
     if let Some(worker) = log_worker {
         let _ = worker.join();
     }
-    result?;
+    let code = result?;
+    if !attached && !stop.load(Ordering::SeqCst) {
+        if code != 0 {
+            bail!(
+                "couldn't launch {bundle_id} on {} (exit status {code})",
+                destination.name
+            );
+        }
+        attach(&mut attached);
+    }
     Ok(0) // app exit status is a console event, not a failed build.
 }
 
@@ -367,6 +409,17 @@ fn physical_memory() -> Option<u64> {
     (rc == 0 && value > 0).then_some(value)
 }
 
+/// The first line simctl (`com.example.App: 4242`) or devicectl
+/// (`Launched application with com.example.App bundle identifier.`) prints
+/// once the app process exists.
+fn launch_marker(line: &str, bundle_id: &str) -> bool {
+    line.contains("Launched application")
+        || line
+            .strip_prefix(bundle_id)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .is_some_and(|pid| !pid.is_empty() && pid.trim().chars().all(|c| c.is_ascii_digit()))
+}
+
 fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).into()).collect()
 }
@@ -405,6 +458,16 @@ fn capture(name: &str, args: &[String], stop: &Arc<AtomicBool>) -> Result<String
         }
         thread::sleep(Duration::from_millis(20));
     };
+    // A descendant that inherited the pipes can keep them open after the
+    // tool exits. Give output a moment to drain, then end the whole group.
+    let drained = Instant::now();
+    while !(out.is_finished() && err.is_finished()) {
+        if stop.load(Ordering::SeqCst) || drained.elapsed() > Duration::from_secs(5) {
+            signal_group(child.id(), libc::SIGKILL);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     let stdout = out
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
@@ -656,10 +719,12 @@ fn scan(reader: impl Read, mut emit: impl FnMut(String)) {
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
-                if discard {
-                    continue;
-                }
                 for &byte in &buffer[..n] {
+                    if discard {
+                        // Skip the rest of the oversized line, then carry on.
+                        discard = byte != b'\n';
+                        continue;
+                    }
                     if byte == b'\n' {
                         if line.last() == Some(&b'\r') {
                             line.pop();
@@ -667,10 +732,9 @@ fn scan(reader: impl Read, mut emit: impl FnMut(String)) {
                         emit(String::from_utf8_lossy(&line).into_owned());
                         line.clear();
                     } else if line.len() >= MAX_LINE {
-                        emit("scanner error: line exceeds 4 MiB".into());
+                        emit("note: a line over 4 MiB was left out".into());
                         discard = true;
                         line.clear();
-                        break;
                     } else {
                         line.push(byte);
                     }
@@ -830,7 +894,7 @@ mod tests {
         input.extend_from_slice(b"\nafter\n");
         let mut lines = vec![];
         scan(&input[..], |l| lines.push(l));
-        assert_eq!(lines, ["scanner error: line exceeds 4 MiB"]);
+        assert_eq!(lines, ["note: a line over 4 MiB was left out", "after"]);
     }
     #[test]
     fn merged_pipe_preserves_write_order_and_exit_code() {
@@ -945,6 +1009,31 @@ while True:time.sleep(.05)
         );
         drop(first);
         let _next = BuildLock::acquire(&project).unwrap();
+    }
+    #[test]
+    fn launch_markers() {
+        assert!(launch_marker("com.example.App: 4242", "com.example.App"));
+        assert!(launch_marker(
+            "Launched application with com.example.App bundle identifier.",
+            "com.example.App"
+        ));
+        assert!(!launch_marker("com.example.App: hello", "com.example.App"));
+        assert!(!launch_marker(
+            "Acquired tunnel connection to device.",
+            "com.example.App"
+        ));
+    }
+    #[test]
+    fn capture_returns_when_a_descendant_keeps_the_pipe_open() {
+        let began = Instant::now();
+        let out = capture(
+            "/bin/sh",
+            &strings(&["-c", "echo done; (sleep 30) & exit 0"]),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "done");
+        assert!(began.elapsed() < Duration::from_secs(10));
     }
     #[test]
     fn cleans_mirror_and_unified_log() {

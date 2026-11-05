@@ -72,12 +72,27 @@ pub fn save_job(p: &Project, j: &Job) -> Result<()> {
         .collect();
     let meta = serde_json::json!({"Kind":j.kind,"Status":j.status,"Outcome":j.outcome,"BuildOutcome":j.build_outcome,"App":j.app,"Started":j.started.to_rfc3339(),"Attached":j.attached.map(|d|d.to_rfc3339()).unwrap_or_else(||"0001-01-01T00:00:00Z".into()),"Elapsed":(j.elapsed*1e9) as u64,"BuildElapsed":(j.build_elapsed*1e9) as u64,"Phases":phases});
     for phase in &j.phases {
-        let mut phase = phase.clone();
-        phase.ensure_loaded();
-        fs::write(
-            dir.join(format!("{}.log", phase.name)),
-            format!("{}\n", phase.lines.join("\n")),
-        )?;
+        let target = dir.join(format!("{}.log", phase.name));
+        if !phase.is_loaded() {
+            // A history log that was never opened: copy the file, don't load it.
+            if let Some(source) = phase.lazy_source()
+                && source != target
+            {
+                fs::copy(source, &target)?;
+            }
+            continue;
+        }
+        // Stream borrowed lines; no clone or joined copy of a large log.
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(fs::File::create(&target)?);
+        for line in &phase.lines {
+            out.write_all(line.as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+        if phase.lines.is_empty() {
+            out.write_all(b"\n")?;
+        }
+        out.flush()?;
     }
     atomic_write(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
     let mut entries = fs::read_dir(root)?

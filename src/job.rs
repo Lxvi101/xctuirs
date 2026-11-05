@@ -46,6 +46,10 @@ impl Phase {
             index: IssueIndex::default(),
         }
     }
+    /// The history file a not-yet-loaded phase will read from.
+    pub fn lazy_source(&self) -> Option<&std::path::Path> {
+        self.lazy_path.as_deref()
+    }
     pub fn is_loaded(&self) -> bool {
         self.lazy_path.is_none()
     }
