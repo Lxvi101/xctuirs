@@ -502,9 +502,9 @@ impl App {
                 if outcome == "failed" {
                     if self.shown == 0 {
                         self.phase = 0;
-                        self.follow = true;
-                        (self.top, self.skip) = (0, 0);
+                        self.filter.clear();
                         self.problems_only = self.jobs[0].phases[0].counts().0 > 0;
+                        self.reset_view();
                     }
                     let stale = self.jobs[0].phases[0].lines.iter().rev().take(40).any(|l| {
                         l.contains("does not contain a scheme named")
@@ -681,12 +681,11 @@ impl App {
         self.phase = self.jobs.get(self.shown).map_or(0, |j| {
             usize::from(j.phases.len() > 1 && j.outcome != "failed")
         });
-        self.follow = true;
-        (self.top, self.skip) = (0, 0);
         self.filter.clear();
         self.problems_only = self.jobs.get(self.shown).is_some_and(|j| {
             j.outcome == "failed" && j.phases.first().is_some_and(|p| p.counts().0 > 0)
         });
+        self.reset_view();
         self.load_shown();
     }
     fn load_shown(&mut self) {
@@ -835,8 +834,10 @@ impl App {
         self.follow = end;
         (self.top, self.skip) = (0, 0);
     }
+    /// Back to the default position: the end of the log, or the top of the
+    /// problems list, where the errors are.
     fn reset_view(&mut self) {
-        self.follow = true;
+        self.follow = !(self.problems_only && self.filter.is_empty());
         (self.top, self.skip) = (0, 0);
     }
     /// Problems for the failure card, cached per run and log length.
@@ -1888,12 +1889,13 @@ fn draw_list(
             w.saturating_sub(right.width() + 1),
         );
         let pad = w.saturating_sub(text.width() + right.width());
+        let selected = n == cursor;
         let line = Line::from(vec![
             Span::styled(text, style),
             Span::raw(" ".repeat(pad)),
-            Span::styled(right, dim()),
+            Span::styled(right, if selected { Style::default() } else { dim() }),
         ]);
-        lines.push(if n == cursor {
+        lines.push(if selected {
             line.style(Style::default().add_modifier(Modifier::REVERSED))
         } else {
             line
@@ -2280,6 +2282,11 @@ mod tests {
         assert!(s.contains("1 of 2 targets"), "{s}");
         assert!(s.contains('%'));
         assert!(s.contains("■ x  Stop"));
+        for n in 0..40 {
+            a.apply(Event::Line(format!(
+                "Puzzle/W.swift:{n}:1: warning: unused"
+            )));
+        }
         a.apply(Event::Line(
             "/src/Puzzle/Board.swift:12:5: error: cannot find 'tile' in scope".into(),
         ));
@@ -2296,6 +2303,9 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("problems"), "{s}");
+        // Errors lead the problems list and are on screen, even behind many warnings.
+        assert!(!a.follow);
+        assert!(s.contains("Puzzle/Board.swift:12:5: error"), "{s}");
     }
 
     #[test]
