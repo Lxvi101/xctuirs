@@ -29,32 +29,42 @@ xctuirs
 
 It prefers a workspace to a project, searches the current directory and one directory down, and discovers schemes from disk before falling back to `xcodebuild -list`. Local Swift package products are shown separately.
 
-Select a scheme in pane 2 and a destination in pane 3 with Enter or Space. Destinations include My Mac, paired physical devices, and available simulators. Physical devices appear in cyan. Press `r` to build, install, launch, and attach the app console.
+One screen:
+
+```text
+ Puzzle   s  ◆ Puzzle    d  ▯ My iPhone
+
+ ⠹ Compiling  BoardView.swift · Puzzle                      1:48 · ~1:05 left
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━──────────────────  62%
+ 18 of 27 targets · 412 tasks · 3 warnings
+ ─ Build  Console ───────────────────────────────────────────────────────────
+ …live log…
+ ▶ r  Run on My iPhone    b build · t test · c clean · h history · ? keys
+```
+
+Press `r` to build, install, launch and attach the console. The header chips are the controls: `s` picks the scheme, `d` the device or simulator (type to filter; physical devices first). If something is missing when you press `r`, the right picker opens.
+
+The progress bar follows xcodebuild's target graph and task stream. After one successful build of a scheme on a destination, it also uses that build's task count and duration, so later builds show an ETA. When a build fails, the first error appears above the log with its file and line, plus a likely fix for common problems (type-checker timeouts, signing, missing pods, locked devices, unshared schemes). The log switches to problems only, errors first; `i` shows the full log. Long builds post a macOS notification when they finish while the terminal is in the background.
 
 | Key | Action |
 | --- | --- |
-| `b`, `r`, `t`, `c`, `p` | Build, run, test, clean, resolve packages |
-| `x` | Stop current operation or attached app |
-| `0`–`4`, Tab / Shift-Tab | Focus detail / status / schemes / destinations / runs |
-| `j` / `k`, arrows | Move selection or scroll log |
-| Mouse wheel / trackpad scroll | Scroll the pane under the pointer |
-| Enter / Space | Select scheme or destination |
-| `[` / `]` | Switch scheme or platform tab |
-| `/`, Enter, Esc | Filter, keep filter, clear filter |
-| `g` / `G`, Page Up / Down | Top / tail, page log |
-| Ctrl-U / Ctrl-D | Scroll half a page |
-| `i`, `s` | Issues only, console timestamps |
-| `+` / `_` | Expand / restore left panes |
-| `e` | Open visible log in `$VISUAL`, `$EDITOR`, or `vi` |
-| `R` | Rename selected simulator |
-| `D` | Delete history with confirmation |
-| `?`, `q` | Help, quit |
+| `r` | Run: build, install, launch, attach the console |
+| `b`, `t`, `c`, `p` | Build, test, clean, resolve packages |
+| `x` | Stop |
+| `s`, `d` | Pick scheme, pick device or simulator (ctrl-r renames a simulator) |
+| `h` | History; Enter opens a past run, `D` deletes all |
+| Tab | Build log ⇄ app console |
+| `i` | Problems only ⇄ full log |
+| `/` | Filter the log (Enter keeps, Esc clears) |
+| ↑ ↓, PgUp/PgDn, Ctrl-U/D, mouse wheel | Scroll (pauses following) |
+| `g` / `G` | Top / follow the end |
+| `e` | Open the visible log in `$VISUAL`, `$EDITOR`, or `vi` |
+| Esc | Clear the filter, or return to the latest run |
+| `?`, `q` | Keys, quit |
 
-Scrolling up in a log pauses automatic following; scroll back to the bottom or press `G` to resume. Wheel scrolling moves a list cursor without selecting a different scheme or destination. Mouse capture is released while the editor is open and when the app exits.
+xctuirs follows the project: if the `.xcworkspace` is deleted or a new one appears, it switches containers and reloads schemes.
 
-A run has a build row and a separate console row. App stdout/stderr and mirrored OS logs appear in the console; a best effort unified log stream supplies app debug messages for simulator and Mac runs. Physical-device console uses `devicectl`.
-
-Selections and up to 50 runs per project are saved under `~/Library/Application Support/xctui/`. Quit cancels the active process, drains its final output, and saves the stopped run. Tool processes are isolated from terminal Ctrl-C; cancellation escalates to SIGKILL after five seconds.
+Selections, up to 50 runs per project, and build estimates are saved under `~/Library/Application Support/xctui/`. Quitting cancels the active process, drains its final output, and saves the stopped run.
 
 ## CLI
 
@@ -85,8 +95,11 @@ cargo build --release
 
 The upstream specification and fixtures are retained in `spec/`. Tests exercise the original parsing, command, log, processing and streaming fixtures, plus CLI conformance and process lifecycle tests using fake tools. See [NOTES.md](NOTES.md) for validation coverage and differences from upstream. No Go runtime, Node runtime, or Xcode plugin is required.
 
-## Resource safeguards
+## Reliability and resources
 
-Following the November 1 resource-exhaustion incident, builds use `xcodebuild -jobs 1`. A per-container advisory lock prevents two xctuirs instances from running the same project's workflow at once. Builds require 20 GiB free at startup and are stopped if free space drops below 10 GiB while xcodebuild runs. Discovery commands time out after 15 seconds instead of hanging shutdown. The TUI redraws on changes rather than repeatedly rewrapping idle logs.
-
-Cancellation first sends the tool's graceful signal, then kills its isolated process group after five seconds if descendants remain. This handles ordinary child compilers even if their parent already exited. Apple's build service can create compiler jobs outside that process group; the runner cannot prove those jobs stopped, and does not kill unrelated system processes. These safeguards also cannot guarantee that a single compiler will fit in available RAM, or prevent other applications from exhausting resources. Build configuration is still controlled by your existing scheme/project settings; no Debug/Release override is added.
+- **Parallelism is bounded by memory**: `-jobs` is about one compiler job per 3 GiB of RAM, at least 2 and at most the CPU count. On a 16 GB machine that is 5. Set `XCTUIRS_JOBS=N` to override it, or `XCTUIRS_JOBS=0` to let xcodebuild decide.
+- **Disk**: a build refuses to start below 3 GiB free and warns below 10 GiB. It stops only when free space falls below 1 GiB.
+- **Signing**: device builds pass `-allowProvisioningUpdates`, so they create or refresh profiles like Xcode does, using the accounts already added to Xcode.
+- **Streaming**: xcodebuild runs with `NSUnbufferedIO=YES` and `-hideShellScriptEnvironment`. Output arrives line by line, without the environment dump for every script phase. Install output is streamed too.
+- **Large logs**: the screen only wraps the visible lines, and errors and warnings are indexed as they arrive. Logs of hundreds of thousands of lines stay responsive.
+- A per-project lock prevents two xctuirs instances from building the same project at once. Cancellation sends the tool's graceful signal, then kills its process group after five seconds.
