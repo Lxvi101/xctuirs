@@ -269,6 +269,7 @@ fn workflow(
         attach(&mut attached);
     }
     let launch_started = Instant::now();
+    let device = destination.device;
     let bundle_id = settings.bundle_id.clone();
     let log_stop = Arc::new(AtomicBool::new(false));
     let log_worker = if !destination.device {
@@ -328,9 +329,14 @@ fn workflow(
         },
         |line| {
             if !attached {
-                if launch_marker(&line, &bundle_id)
-                    || launch_started.elapsed() > Duration::from_secs(3)
-                {
+                // devicectl prints tunnel/disk-image preamble before launching;
+                // simctl's first non-error line already comes from the app.
+                let confirmed = if device {
+                    launch_marker(&line, &bundle_id)
+                } else {
+                    !tool_error(&line)
+                };
+                if confirmed || launch_started.elapsed() > Duration::from_secs(3) {
                     attach(&mut attached);
                 } else {
                     // Tool preamble (device tunnel, disk image services).
@@ -418,6 +424,16 @@ fn launch_marker(line: &str, bundle_id: &str) -> bool {
             .strip_prefix(bundle_id)
             .and_then(|rest| rest.strip_prefix(": "))
             .is_some_and(|pid| !pid.is_empty() && pid.trim().chars().all(|c| c.is_ascii_digit()))
+}
+
+/// simctl/devicectl failure output, as opposed to app output.
+fn tool_error(line: &str) -> bool {
+    let l = line.trim_start();
+    l.starts_with("An error was encountered")
+        || l.starts_with("ERROR:")
+        || l.starts_with("Error:")
+        || l.starts_with("error:")
+        || l.starts_with("Error Domain=")
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
