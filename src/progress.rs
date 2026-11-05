@@ -205,13 +205,13 @@ impl Progress {
     pub fn remaining(&mut self, elapsed: f64) -> Option<f64> {
         let e = self.estimate?;
         let f = self.fraction(elapsed);
+        let historical = (e.seconds - elapsed).max(1.0);
         if f < 0.08 {
-            return Some((e.seconds - elapsed).max(1.0));
+            return Some(historical);
         }
-        let projected = elapsed / f;
-        // Lean on the projection as the build advances.
-        let blended = projected * f + e.seconds * (1.0 - f);
-        Some((blended - elapsed).max(1.0))
+        // This build's own pace, trusted more as it advances.
+        let projected = elapsed * (1.0 - f) / f;
+        Some((f * projected + (1.0 - f) * historical).max(1.0))
     }
 }
 
@@ -402,6 +402,16 @@ mod tests {
         assert!((f - 0.5).abs() < 0.01, "{f}");
         let left = p.remaining(50.0).unwrap();
         assert!((40.0..=60.0).contains(&left), "{left}");
+        // A much slower build than last time shows a longer ETA.
+        let mut slow = Progress::new(Some(Estimate {
+            tasks: 100,
+            seconds: 100.0,
+        }));
+        for _ in 0..50 {
+            slow.line("SwiftCompile normal arm64 /s/a.swift (in target 'App' from project 'App')");
+        }
+        let left = slow.remaining(1000.0).unwrap();
+        assert!(left > 150.0, "{left}");
         // Never 100% before the tool says so.
         for _ in 0..500 {
             p.line("SwiftCompile normal arm64 /s/a.swift (in target 'App' from project 'App')");

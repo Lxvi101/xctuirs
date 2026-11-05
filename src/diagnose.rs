@@ -103,7 +103,11 @@ fn hint_for(text: &str) -> Option<&'static str> {
 pub fn problems(lines: &[String], limit: usize) -> Vec<Problem> {
     let mut out: Vec<Problem> = vec![];
     let mut tool: Vec<Problem> = vec![];
+    let mut seen = std::collections::HashSet::new();
     for line in lines {
+        if out.len() >= limit {
+            break; // enough source errors; tool errors would sort after them
+        }
         let line = line.trim();
         if let Some(c) = location().captures(line) {
             let p = Problem {
@@ -111,7 +115,7 @@ pub fn problems(lines: &[String], limit: usize) -> Vec<Problem> {
                 message: c[3].trim().to_owned(),
                 hint: hint_for(&c[3]),
             };
-            if !out.contains(&p) {
+            if seen.insert((p.place.clone(), p.message.clone())) {
                 out.push(p);
             }
         } else if let Some(i) = line.find("error: ") {
@@ -124,7 +128,7 @@ pub fn problems(lines: &[String], limit: usize) -> Vec<Problem> {
                 message: message.to_owned(),
                 hint: hint_for(message),
             };
-            if !tool.contains(&p) {
+            if tool.len() < limit && seen.insert((String::new(), p.message.clone())) {
                 tool.push(p);
             }
         }

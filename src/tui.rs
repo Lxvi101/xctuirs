@@ -134,6 +134,15 @@ enum Discovery {
     },
 }
 
+/// Visible line numbers for the current run, phase, filter and mode.
+#[derive(Default)]
+struct ViewCache {
+    key: Option<(i64, usize, String, bool)>,
+    scanned: usize,
+    fresh_done: bool,
+    indices: Option<Vec<usize>>,
+}
+
 /// The job currently running, with what the screen needs to show its progress.
 struct Live {
     task: Option<Task>,
@@ -163,6 +172,9 @@ struct App {
     live: Option<Live>,
     follow: bool,
     top: usize,
+    skip: usize,
+    view: ViewCache,
+    diagnosis: Option<((i64, usize), Vec<diagnose::Problem>)>,
     problems_only: bool,
     filter: String,
     typing: bool,
@@ -202,6 +214,9 @@ impl App {
             live: None,
             follow: true,
             top: 0,
+            skip: 0,
+            view: ViewCache::default(),
+            diagnosis: None,
             problems_only: false,
             filter: String::new(),
             typing: false,
@@ -488,7 +503,7 @@ impl App {
                     if self.shown == 0 {
                         self.phase = 0;
                         self.follow = true;
-                        self.top = 0;
+                        (self.top, self.skip) = (0, 0);
                         self.problems_only = self.jobs[0].phases[0].counts().0 > 0;
                     }
                     let stale = self.jobs[0].phases[0].lines.iter().rev().take(40).any(|l| {
@@ -667,7 +682,7 @@ impl App {
             usize::from(j.phases.len() > 1 && j.outcome != "failed")
         });
         self.follow = true;
-        self.top = 0;
+        (self.top, self.skip) = (0, 0);
         self.filter.clear();
         self.problems_only = self.jobs.get(self.shown).is_some_and(|j| {
             j.outcome == "failed" && j.phases.first().is_some_and(|p| p.counts().0 > 0)
@@ -685,99 +700,175 @@ impl App {
     fn shown_phase(&self) -> Option<&job::Phase> {
         self.jobs.get(self.shown)?.phases.get(self.phase)
     }
-    /// Line numbers visible under the current view: everything, problems
-    /// (errors first), or filter matches. `None` means every line.
-    fn indices(&self) -> Option<Vec<usize>> {
-        let phase = self.shown_phase()?;
+    /// Brings the cached list of visible line numbers up to date: everything
+    /// (`None`), problems (errors first), or filter matches. Appended lines are
+    /// scanned incrementally, so a live 200k-line log is never rescanned per frame.
+    fn refresh_view(&mut self) {
+        let Some(job) = self.jobs.get(self.shown) else {
+            self.view = ViewCache::default();
+            return;
+        };
+        let Some(phase) = job.phases.get(self.phase) else {
+            self.view = ViewCache::default();
+            return;
+        };
+        let key = (
+            job.started.timestamp_nanos_opt().unwrap_or(0),
+            self.phase,
+            self.filter.clone(),
+            self.problems_only,
+        );
+        let len = phase.lines.len();
+        if self.view.key.as_ref() != Some(&key) || self.view.scanned > len {
+            self.view = ViewCache {
+                key: Some(key),
+                ..ViewCache::default()
+            };
+        }
+        if self.view.fresh_done && self.view.scanned == len {
+            return;
+        }
+        self.view.fresh_done = true;
         if !self.filter.is_empty() {
             let needle = self.filter.to_lowercase();
-            return Some(
-                phase
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| l.to_lowercase().contains(&needle))
-                    .map(|(i, _)| i)
-                    .collect(),
-            );
-        }
-        if self.problems_only {
+            let v = self.view.indices.get_or_insert_with(Vec::new);
+            for (i, line) in phase.lines.iter().enumerate().skip(self.view.scanned) {
+                if line.to_lowercase().contains(&needle) {
+                    v.push(i);
+                }
+            }
+        } else if self.problems_only {
             let issues = phase.issue_indices();
             let (errors, warnings): (Vec<usize>, Vec<usize>) = issues
                 .iter()
                 .partition(|&&i| job::kind(&phase.lines[i]) == "error");
-            return Some(errors.into_iter().chain(warnings).collect());
+            self.view.indices = Some(errors.into_iter().chain(warnings).collect());
+        } else {
+            self.view.indices = None;
         }
-        None
+        self.view.scanned = len;
     }
-    fn visible_len(&self, indices: &Option<Vec<usize>>) -> usize {
-        match indices {
+    fn visible_len(&self) -> usize {
+        match &self.view.indices {
             Some(v) => v.len(),
             None => self.shown_phase().map_or(0, |p| p.lines.len()),
         }
     }
-    fn line_at<'a>(&'a self, indices: &Option<Vec<usize>>, n: usize) -> &'a str {
+    fn line_at(&self, n: usize) -> &str {
         let Some(phase) = self.shown_phase() else {
             return "";
         };
-        let i = match indices {
-            Some(v) => v[n],
+        let i = match &self.view.indices {
+            Some(v) => v.get(n).copied().unwrap_or(usize::MAX),
             None => n,
         };
-        clean(&phase.lines[i])
+        phase.lines.get(i).map_or("", |l| clean(l))
     }
-    /// First visible line when following the end, found by wrapping backwards
-    /// only as many lines as fit.
-    fn tail_top(&self, indices: &Option<Vec<usize>>) -> usize {
-        let len = self.visible_len(indices);
-        let width = self.log_area.width.max(1) as usize;
+    fn rows_at(&self, n: usize) -> usize {
+        wrapped_rows(self.line_at(n), self.log_area.width.max(1) as usize)
+    }
+    /// Position (line, rows hidden above it) that shows the last screenful.
+    /// A single line taller than the viewport shows its final rows.
+    fn tail_pos(&self) -> (usize, usize) {
         let height = self.log_area.height.max(1) as usize;
         let mut rows = 0;
-        let mut top = len;
+        let mut top = self.visible_len();
         while top > 0 {
-            let r = wrapped_rows(self.line_at(indices, top - 1), width);
-            if rows > 0 && rows + r > height {
-                break;
+            let r = self.rows_at(top - 1);
+            if rows + r >= height {
+                return (top - 1, rows + r - height);
             }
             rows += r;
             top -= 1;
-            if rows >= height {
-                break;
-            }
         }
-        top
+        (0, 0)
     }
-    fn scroll(&mut self, delta: isize) {
-        let indices = self.indices();
-        let tail = self.tail_top(&indices);
-        let current = if self.follow {
+    /// Where the view starts, as (line, rows of that line scrolled away).
+    fn view_pos(&self) -> (usize, usize) {
+        let tail = self.tail_pos();
+        if self.follow {
             tail
         } else {
-            self.top.min(tail)
-        };
-        let next = current.saturating_add_signed(delta).min(tail);
-        self.top = next;
-        self.follow = next >= tail;
+            (self.top, self.skip).min(tail)
+        }
+    }
+    /// Scrolls by screen rows, so wrapped lines of any length are reachable.
+    fn scroll(&mut self, delta: isize) {
+        self.refresh_view();
+        let tail = self.tail_pos();
+        let (mut top, mut skip) = self.view_pos();
+        let len = self.visible_len();
+        if delta > 0 {
+            skip += delta as usize;
+            while top < len && skip >= self.rows_at(top) {
+                skip -= self.rows_at(top);
+                top += 1;
+            }
+        } else {
+            let mut d = delta.unsigned_abs();
+            if skip >= d {
+                skip -= d;
+            } else {
+                d -= skip;
+                skip = 0;
+                while d > 0 && top > 0 {
+                    top -= 1;
+                    let r = self.rows_at(top);
+                    if r >= d {
+                        skip = r - d;
+                        d = 0;
+                    } else {
+                        d -= r;
+                    }
+                }
+            }
+        }
+        if (top, skip) >= tail {
+            self.follow = true;
+            (self.top, self.skip) = (0, 0);
+        } else {
+            self.follow = false;
+            (self.top, self.skip) = (top, skip);
+        }
     }
     fn jump(&mut self, end: bool) {
         self.follow = end;
-        self.top = 0;
+        (self.top, self.skip) = (0, 0);
     }
     fn reset_view(&mut self) {
         self.follow = true;
-        self.top = 0;
+        (self.top, self.skip) = (0, 0);
+    }
+    /// Problems for the failure card, cached per run and log length.
+    fn problems(&mut self) -> Vec<diagnose::Problem> {
+        let Some(job) = self.jobs.get(self.shown) else {
+            return vec![];
+        };
+        let Some(phase) = job.phases.first().filter(|p| p.is_loaded()) else {
+            return vec![];
+        };
+        let key = (
+            job.started.timestamp_nanos_opt().unwrap_or(0),
+            phase.lines.len(),
+        );
+        match &self.diagnosis {
+            Some((k, problems)) if *k == key => problems.clone(),
+            _ => {
+                let problems = diagnose::problems(&phase.lines, 2);
+                self.diagnosis = Some((key, problems.clone()));
+                problems
+            }
+        }
     }
 
     fn edit<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
-        let indices = self.indices();
-        let len = self.visible_len(&indices);
+        self.refresh_view();
+        let len = self.visible_len();
         if len == 0 {
             self.say("Nothing to open");
             return Ok(());
         }
-        let text: String = (0..len)
-            .map(|n| format!("{}\n", self.line_at(&indices, n)))
-            .collect();
+        let text: String = (0..len).map(|n| format!("{}\n", self.line_at(n))).collect();
         let path = std::env::temp_dir().join(format!(
             "xctui-{}-{}.log",
             std::process::id(),
@@ -1288,6 +1379,7 @@ fn draw(app: &mut App, frame: &mut Frame) {
     let x = area.x + 1;
     let w = area.width - 2;
     draw_header(app, frame, Rect::new(x, area.y, w, 1));
+    app.refresh_view();
     let status = status_lines(app, w as usize);
     let status_h = status.len() as u16;
     frame.render_widget(
@@ -1517,6 +1609,7 @@ fn status_lines(app: &mut App, width: usize) -> Vec<Line<'static>> {
         ];
     }
     // Idle: the shown run's outcome, or a ready state.
+    let problems = app.problems();
     let Some(job) = app.jobs.get(app.shown) else {
         let ready = match (app.selected_scheme(), app.selected_destination()) {
             (Some(_), Some(d)) => format!("Ready to run on {}", d.name),
@@ -1567,12 +1660,6 @@ fn status_lines(app: &mut App, width: usize) -> Vec<Line<'static>> {
     }
     let mut lines = vec![split_line(left, vec![Span::styled(when, dim())], width)];
     if job.outcome == "failed" {
-        let phase = &job.phases[0];
-        let problems = if phase.is_loaded() {
-            diagnose::problems(&phase.lines, 2)
-        } else {
-            vec![]
-        };
         for p in problems.iter().take(2) {
             let mut spans = vec![];
             if !p.place.is_empty() {
@@ -1645,8 +1732,7 @@ fn draw_log(app: &App, frame: &mut Frame) {
     if area.height == 0 {
         return;
     }
-    let indices = app.indices();
-    let len = app.visible_len(&indices);
+    let len = app.visible_len();
     let width = area.width.max(1) as usize;
     let height = area.height as usize;
     if len == 0 {
@@ -1664,14 +1750,16 @@ fn draw_log(app: &App, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(Line::styled(text, dim())), area);
         return;
     }
-    let tail = app.tail_top(&indices);
-    let top = if app.follow { tail } else { app.top.min(tail) };
+    let (top, mut skip) = app.view_pos();
     let mut rows: Vec<Line> = Vec::with_capacity(height);
     let mut n = top;
     while rows.len() < height && n < len {
-        let text = app.line_at(&indices, n);
+        let text = app.line_at(n);
         let style = line_style(text);
-        for part in wrap(text, width) {
+        for part in wrap(text, width)
+            .into_iter()
+            .skip(std::mem::take(&mut skip))
+        {
             if rows.len() == height {
                 break;
             }
@@ -2125,6 +2213,9 @@ mod tests {
             live: None,
             follow: true,
             top: 0,
+            skip: 0,
+            view: ViewCache::default(),
+            diagnosis: None,
             problems_only: false,
             filter: String::new(),
             typing: false,
@@ -2292,6 +2383,28 @@ mod tests {
     }
 
     #[test]
+    fn a_line_taller_than_the_screen_is_fully_reachable() {
+        let mut a = app();
+        let mut t = term();
+        press(&mut a, &mut t, KeyCode::Char('b'));
+        a.apply(Event::Line("before".into()));
+        a.apply(Event::Line(format!("START{}END", "x".repeat(5000))));
+        let s = screen(&mut a, &mut t);
+        assert!(
+            s.contains("END"),
+            "following shows the end of the long line\n{s}"
+        );
+        assert!(!s.contains("START"));
+        for _ in 0..200 {
+            press(&mut a, &mut t, KeyCode::Up);
+        }
+        let s = screen(&mut a, &mut t);
+        assert!(s.contains("before") && s.contains("START"), "{s}");
+        press(&mut a, &mut t, KeyCode::Char('G'));
+        assert!(screen(&mut a, &mut t).contains("END"));
+    }
+
+    #[test]
     fn history_opens_an_older_run() {
         let mut a = app();
         let mut t = term();
@@ -2334,6 +2447,23 @@ mod tests {
         assert!(
             began.elapsed() < Duration::from_millis(1500),
             "20 frames took {:?}",
+            began.elapsed()
+        );
+        // Filter and problems views are cached, not rebuilt per frame/scroll.
+        a.filter = "number/1999".into();
+        screen(&mut a, &mut t);
+        a.problems_only = true;
+        a.filter.clear();
+        a.apply(Event::Line("x.swift:1:1: error: boom".into()));
+        screen(&mut a, &mut t);
+        let began = Instant::now();
+        for _ in 0..20 {
+            press(&mut a, &mut t, KeyCode::Up);
+            screen(&mut a, &mut t);
+        }
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "20 problem-view frames took {:?}",
             began.elapsed()
         );
     }
