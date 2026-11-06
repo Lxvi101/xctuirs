@@ -23,7 +23,7 @@ sha1 = "0.10"
 libc = "0.2"
 os_pipe = "1"
 ctrlc = { version = "3", features = ["termination"] }
-crossterm = "0.28"
+crossterm = "0.29"
 ratatui = "0.29"
 unicode-width = "0.2"
 
