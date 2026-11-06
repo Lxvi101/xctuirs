@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 description = "A Rust terminal companion for Xcode: build, test and run without opening the IDE"
 license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/Lxvi101/xctuirs"
+homepage = "https://github.com/Lxvi101/xctuirs"
+readme = "README.md"
+keywords = ["xcode", "xcodebuild", "ios", "tui", "simulator"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/.github", "/spec/screens"]
 
 [dependencies]
 anyhow = "1"

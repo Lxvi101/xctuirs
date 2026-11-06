@@ -2322,10 +2322,7 @@ mod tests {
         a.apply(Event::Console("hello from the app".into()));
         assert_eq!(a.phase, 1);
         let s = screen(&mut a, &mut t);
-        assert!(
-            s.contains("Running com.example.Puzzle on My iPhone"),
-            "{s}"
-        );
+        assert!(s.contains("Running com.example.Puzzle on My iPhone"), "{s}");
         assert!(s.contains("hello from the app"));
         assert!(s.contains("Stop app"));
         press(&mut a, &mut t, KeyCode::Tab);

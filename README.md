@@ -1,16 +1,21 @@
 # xctuirs
 
+[![CI](https://github.com/Lxvi101/xctuirs/actions/workflows/ci.yml/badge.svg)](https://github.com/Lxvi101/xctuirs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A Rust terminal companion for Xcode projects, based on [libec/xctui](https://github.com/libec/xctui). Build, test, install, and run an Apple app without opening the Xcode IDE.
 
 The application is implemented in Rust. It invokes Apple's `xcodebuild`, `simctl`, `devicectl`, and logging tools; **Xcode must still be installed** for SDKs, compilers, simulators, and signing. This is a development runner for existing Xcode projects, not a replacement compiler or project generator.
 
 ## Install
 
-Requires macOS, Xcode, and a current Rust toolchain (edition 2024).
+Requires macOS, Xcode, and Rust 1.88 or newer.
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/Lxvi101/xctuirs --locked
 ```
+
+Or from a checkout: `cargo install --path . --locked`.
 
 Make sure `~/.cargo/bin` is on `PATH`. If the selected developer directory points to Command Line Tools rather than Xcode, select your Xcode installation:
 
@@ -103,3 +108,17 @@ The upstream specification and fixtures are retained in `spec/`. Tests exercise 
 - **Streaming**: xcodebuild runs with `NSUnbufferedIO=YES` and `-hideShellScriptEnvironment`. Output arrives line by line, without the environment dump for every script phase. Install output is streamed too.
 - **Large logs**: the screen only wraps the visible lines, and errors and warnings are indexed as they arrive. Logs of hundreds of thousands of lines stay responsive.
 - A per-project lock prevents two xctuirs instances from building the same project at once. Cancellation sends the tool's graceful signal, then kills its process group after five seconds.
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports with the failing part of a build log (`e` opens it in your editor) are the most useful kind.
+
+## Acknowledgements
+
+xctuirs is a Rust reimplementation of [xctui](https://github.com/libec/xctui) by Libor Huspenina. The behavior specification, fixtures and conformance checker in `spec/` come from that project under the MIT license.
+
+xctuirs is not affiliated with or endorsed by Apple. Xcode, iOS and macOS are trademarks of Apple Inc.
+
+## License
+
+[MIT](LICENSE)

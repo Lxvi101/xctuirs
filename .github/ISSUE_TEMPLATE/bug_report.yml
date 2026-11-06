@@ -1,0 +1,29 @@
+name: Bug report
+description: Something failed, hung or showed the wrong thing
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you pressed, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Relevant log
+      description: The failing part of the log (press `e` to open it in your editor). Remove team IDs, signing identities and device names.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `sw_vers -productVersion`, `xcodebuild -version` and `xctuirs --version` (or the commit).
+    validations:
+      required: true
+  - type: dropdown
+    id: destination
+    attributes:
+      label: Destination
+      options: [Simulator, Physical device, My Mac, Not relevant]

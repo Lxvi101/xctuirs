@@ -10,7 +10,7 @@ Implemented from the upstream xctui behavior specification at libec/xctui commit
 - Device signing uses existing project settings. Device install and console use `devicectl`; simulator runs use `simctl`; Mac runs execute the app directly.
 - Merged stdout/stderr, bounded channels, 4 MiB line limit, console timestamps, mirrored OS logs, best effort debug log stream.
 - Isolated process groups, correct tool stop signals, five-second escalation, drain-and-wait shutdown.
-- Five-pane terminal UI, filters, issues, wrapped log following and scrolling, two phases per run, editor, rename, history deletion, help.
+- Single-screen terminal UI with live build progress and ETA, failure diagnosis, filters, problems view, wrapped log following and scrolling, two phases per run, editor, rename, history, help.
 - Atomic preferences, project-keyed history, metadata-first lazy log loading, 50-run retention, corrupt-history recovery.
 
 ## Verification
